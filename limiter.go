@@ -41,30 +41,31 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		now := time.Now()
 		client, exists := rl.clients[ip]
 
-		if !exists {
-			rl.clients[ip] = &Client{count: 1, windowStart: now}
-			next.ServeHTTP(w, r)
-			return
-		}
+		// تنظیم هدرهای استاندارد ریت لیمیت
+		w.Header().Set("X-RateLimit-Limit", string(rune(rl.limit)))
 
-		if now.Sub(client.windowStart) > rl.window {
-			client.count = 1
-			client.windowStart = now
+		if !exists || now.Sub(client.windowStart) > rl.window {
+			rl.clients[ip] = &Client{count: 1, windowStart: now}
+			w.Header().Set("X-RateLimit-Remaining", string(rune(rl.limit-1)))
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		if client.count < rl.limit {
 			client.count++
+			remaining := rl.limit - client.count
+			w.Header().Set("X-RateLimit-Remaining", string(rune(remaining)))
 			next.ServeHTTP(w, r)
 			return
 		}
 
+		// اگر از حد مجاز گذشت
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
-		json.NewEncoder(w).Encode(map[string]string{
+		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":   "Too Many Requests",
-			"message": "لرد شن اجازه ورود نمی‌دهد! درخواست‌های شما بیش از حد مجاز است.",
+			"message": "لرد شن اجازه عبور نمی‌دهد! ترافیک بیش از حد مجاز است.",
+			"retry_after_seconds": int(rl.window.Seconds()),
 		})
 	})
 }
