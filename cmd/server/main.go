@@ -1,40 +1,35 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"net/http"
-	"os"
-
-	"github.com/mamadhosein23/lord-shen/internal/config"
-	"github.com/mamadhosein23/lord-shen/internal/limiter"
-	"github.com/mamadhosein23/lord-shen/internal/middleware"
+	"time"
 )
 
 func main() {
-	cfg := config.Load()
+	mux := http.NewServeMux()
 
-	lb := limiter.NewTokenBucket(limiter.Config{
-		Rate:         cfg.Rate,
-		Burst:        cfg.Burst,
-		CleanupEvery: cfg.CleanupEvery,
-		KeyTTL:       cfg.KeyTTL,
+	// ایجاد لرد شن: حداکثر ۳ درخواست در هر ۱۰ ثانیه برای هر IP
+	limiter := NewRateLimiter(3, 10*time.Second)
+
+	// روت محافظت شده
+	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success": true, "data": "خوش آمدید! از سد دفاعی لرد شن عبور کردید."}`))
 	})
 
-	mux := http.NewServeMux()
+	mux.Handle("/api/data", limiter.Middleware(apiHandler))
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","message":"welcome behind Lord Shen 🦚"}`))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"message": "Lord Shen Rate Limiter Engine is running!"}`))
 	})
 
-	handler := middleware.RateLimit(lb, mux)
-
-	port := os.Getenv("ADDR")
-	if port == "" {
-		port = cfg.Addr
-	}
-
-	log.Printf("🦚 Lord Shen listening on %s (rate=%.1f/s, burst=%d)", port, cfg.Rate, cfg.Burst)
-	if err := http.ListenAndServe(port, handler); err != nil {
-		log.Fatalf("server error: %v", err)
+	port := ":8080"
+	fmt.Printf("Lord Shen is awakening on port %s...\n", port)
+	if err := http.ListenAndServe(port, mux); err != nil {
+		fmt.Printf("Server failed to start: %v\n", err)
 	}
 }
