@@ -1,59 +1,106 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"time"
 )
 
 type Config struct {
-	Addr         string        // پورت سرور
-	Rate         float64       // توکن بر ثانیه
+	Addr         string        // پورت یا آدرس لیسنر سرور
+	Rate         float64       // نرخ تولید توکن در ثانیه
 	Burst        int           // ظرفیت باکت
-	CleanupEvery time.Duration // فاصله پاکسازی
-	KeyTTL       time.Duration // عمر کلید
+	CleanupEvery time.Duration // بازه زمانی پاکسازی کلیدهای منقضی‌شده
+	KeyTTL       time.Duration // مدت زمان انقضای کلید
 }
 
-func Load() Config {
-	return Config{
-		Addr:         env("ADDR", ":8080"),
-		Rate:         envFloat("RATE", 5.0),  // پیش‌فرض: ۵ درخواست بر ثانیه
-		Burst:        envInt("BURST", 10),    // پیش‌فرض: اجازه‌ی ۱۰ درخواست همزمان
-		CleanupEvery: envDur("CLEANUP_EVERY", time.Minute),
-		KeyTTL:       envDur("KEY_TTL", 10*time.Minute),
+// Load تنظیمات را از متغیرهای محیطی خوانده و مقادیر را اعتبارسنجی می‌کند.
+func Load() (*Config, error) {
+	cfg := &Config{
+		Addr: getEnv("ADDR", ":8080"),
 	}
+
+	var err error
+
+	if cfg.Rate, err = getEnvFloat("RATE", 5.0); err != nil {
+		return nil, fmt.Errorf("invalid RATE: %w", err)
+	}
+
+	if cfg.Burst, err = getEnvInt("BURST", 10); err != nil {
+		return nil, fmt.Errorf("invalid BURST: %w", err)
+	}
+
+	if cfg.CleanupEvery, err = getEnvDuration("CLEANUP_EVERY", time.Minute); err != nil {
+		return nil, fmt.Errorf("invalid CLEANUP_EVERY: %w", err)
+	}
+
+	if cfg.KeyTTL, err = getEnvDuration("KEY_TTL", 10*time.Minute); err != nil {
+		return nil, fmt.Errorf("invalid KEY_TTL: %w", err)
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
+
+	return cfg, nil
 }
 
-func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+func (c *Config) validate() error {
+	if c.Rate <= 0 {
+		return fmt.Errorf("rate must be greater than zero, got %f", c.Rate)
+	}
+	if c.Burst <= 0 {
+		return fmt.Errorf("burst must be greater than zero, got %d", c.Burst)
+	}
+	if c.CleanupEvery <= 0 {
+		return fmt.Errorf("cleanup interval must be positive")
+	}
+	if c.KeyTTL <= 0 {
+		return fmt.Errorf("key TTL must be positive")
+	}
+	return nil
+}
+
+func getEnv(key, def string) string {
+	if val, ok := os.LookupEnv(key); ok && val != "" {
+		return val
 	}
 	return def
 }
 
-func envInt(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+func getEnvInt(key string, def int) (int, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || val == "" {
+		return def, nil
 	}
-	return def
+	res, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, err
+	}
+	return res, nil
 }
 
-func envFloat(k string, def float64) float64 {
-	if v := os.Getenv(k); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
+func getEnvFloat(key string, def float64) (float64, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || val == "" {
+		return def, nil
 	}
-	return def
+	res, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return 0, err
+	}
+	return res, nil
 }
 
-func envDur(k string, def time.Duration) time.Duration {
-	if v := os.Getenv(k); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || val == "" {
+		return def, nil
 	}
-	return def
+	res, err := time.ParseDuration(val)
+	if err != nil {
+		return 0, err
+	}
+	return res, nil
 }
