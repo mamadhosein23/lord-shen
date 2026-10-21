@@ -2,50 +2,51 @@ package limiter
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 )
 
-// Result نتیجه‌ی یک درخواست را توصیف می‌کند.
+// Result نتیجه‌ی ارزیابی یک درخواست را توصیف می‌کند.
 type Result struct {
-	Allowed   bool
-	Limit     int
-	Remaining int
-	ResetAt   time.Time
-	RetryAfter time.Duration // در صورت رد شدن
+	Allowed    bool
+	Limit      int
+	Remaining  int
+	ResetAt    time.Time
+	RetryAfter time.Duration
 }
 
 // Limiter قرارداد اصلی موتور نرخ‌دهی است.
-// هر پیاده‌سازی (In-Memory یا Redis) باید این را رعایت کند.
 type Limiter interface {
 	Allow(ctx context.Context, key string) (Result, error)
+	Close() error
 }
 
-// ---------- Token Bucket ----------
-
-// bucket ظرفیت و وضعیت فعلی یک توکن باکت است.
 type bucket struct {
+	mu       sync.Mutex
 	tokens   float64
 	lastSeen time.Time
 }
 
-// Config تنظیمات موتور است.
+// Config تنظیمات عملیاتی موتور TokenBucket است.
 type Config struct {
-	Rate      float64       // توکن‌های تولیدشده در هر ثانیه
-	Burst     int           // حداکثر ظرفیت باکت (اجازه‌ی Burst)
-	CleanupEvery time.Duration // فاصله‌ی پاکسازی کلیدهای منقضی
-	KeyTTL    time.Duration // عمر یک کلید بدون فعالیت
+	Rate         float64
+	Burst        int
+	CleanupEvery time.Duration
+	KeyTTL       time.Duration
 }
 
-// TokenBucket پیاده‌سازی In-Memory و Concurrent-Safe است.
+// TokenBucket پیاده‌سازی هم‌روند و امن در حافظه.
 type TokenBucket struct {
-	cfg Config
-	mu   sync.Mutex
+	cfg     Config
+	mu      sync.RWMutex
 	buckets map[string]*bucket
-	now  func() time.Time // برای تست‌پذیری (قابلیت تزریق زمان)
+	now     func() time.Time
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
-// NewTokenBucket یک موتور جدید می‌سازد و پاکساز پس‌زمینه را شروع می‌کند.
+// NewTokenBucket یک موتور جدید می‌سازد و پاکساز را به همراه Graceful Shutdown مقداردهی می‌کند.
 func NewTokenBucket(cfg Config) *TokenBucket {
 	if cfg.CleanupEvery <= 0 {
 		cfg.CleanupEvery = time.Minute
@@ -53,45 +54,53 @@ func NewTokenBucket(cfg Config) *TokenBucket {
 	if cfg.KeyTTL <= 0 {
 		cfg.KeyTTL = 10 * time.Minute
 	}
+
 	tb := &TokenBucket{
 		cfg:     cfg,
 		buckets: make(map[string]*bucket),
 		now:     time.Now,
+		stopCh:  make(chan struct{}),
 	}
-	go tb.janitor() // Goroutine پاکسازی حافظه
+
+	tb.wg.Add(1)
+	go tb.janitor()
+
 	return tb
 }
 
-// Allow بررسی می‌کند آیا کلید (مثلاً IP کاربر) مجاز به درخواست است یا نه.
+// Allow بررسی می‌کند آیا درخواست مربوط به کلید مجاز است یا خیر.
 func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
+	b := tb.getOrCreateBucket(key)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	now := tb.now()
-	b, ok := tb.buckets[key]
-	if !ok {
-		b = &bucket{tokens: float64(tb.cfg.Burst), lastSeen: now}
-		tb.buckets[key] = b
-	}
-
-	// شارژ توکن بر اساس زمان سپری‌شده
 	elapsed := now.Sub(b.lastSeen).Seconds()
-	b.tokens = min(float64(tb.cfg.Burst), b.tokens+elapsed*tb.cfg.Rate)
 	b.lastSeen = now
 
-	if b.tokens >= 1 {
-		b.tokens--
-		reset := now.Add(time.Until(timeOfNextToken(b.tokens, tb.cfg.Rate)))
+	// شارژ توکن‌ها با رعایت سقف Burst
+	b.tokens = math.Min(float64(tb.cfg.Burst), b.tokens+elapsed*tb.cfg.Rate)
+
+	if b.tokens >= 1.0 {
+		b.tokens -= 1.0
+		remaining := int(b.tokens)
+		// زمان لازم تا پر شدن کامل باکت (Burst)
+		fillDuration := time.Duration((float64(tb.cfg.Burst)-b.tokens)/tb.cfg.Rate * float64(time.Second))
+
 		return Result{
-			Allowed:   true,
-			Limit:     tb.cfg.Burst,
-			Remaining: int(b.tokens),
-			ResetAt:   reset,
+			Allowed:    true,
+			Limit:      tb.cfg.Burst,
+			Remaining:  remaining,
+			ResetAt:    now.Add(fillDuration),
+			RetryAfter: 0,
 		}, nil
 	}
 
-	// رد شد؛ محاسبه‌ی زمان انتظار برای توکن بعدی
-	retry := time.Duration((1 - b.tokens) / tb.cfg.Rate * float64(time.Second))
+	// در صورت رد شدن: محاسبه دقیق کسری تا دسترسی به ۱ توکن
+	missing := 1.0 - b.tokens
+	retry := time.Duration(missing / tb.cfg.Rate * float64(time.Second))
+
 	return Result{
 		Allowed:    false,
 		Limit:      tb.cfg.Burst,
@@ -101,23 +110,60 @@ func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
 	}, nil
 }
 
-// timeOfNextToken زمان رسیدن توکن بعدی را برمی‌گرداند (برای هدر Reset).
-func timeOfNextToken(tokens, rate float64) time.Duration {
-	return time.Duration((1 - tokens) / rate * float64(time.Second))
+func (tb *TokenBucket) getOrCreateBucket(key string) *bucket {
+	tb.mu.RLock()
+	b, ok := tb.buckets[key]
+	tb.mu.RUnlock()
+	if ok {
+		return b
+	}
+
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	// Double-check locking جهت جلوگیری از ایجاد مجدد در ریس‌کاندیشن
+	if b, ok = tb.buckets[key]; ok {
+		return b
+	}
+
+	now := tb.now()
+	b = &bucket{
+		tokens:   float64(tb.cfg.Burst),
+		lastSeen: now,
+	}
+	tb.buckets[key] = b
+	return b
 }
 
-// janitor کلیدهای منقضی را به‌صورت دوره‌ای حذف می‌کند (جلوگیری از Memory Leak).
+// Close برای جلوگیری از نشت منابع و اتمام کار گوروتین پاکساز.
+func (tb *TokenBucket) Close() error {
+	close(tb.stopCh)
+	tb.wg.Wait()
+	return nil
+}
+
 func (tb *TokenBucket) janitor() {
+	defer tb.wg.Done()
 	ticker := time.NewTicker(tb.cfg.CleanupEvery)
 	defer ticker.Stop()
-	for range ticker.C {
-		cutoff := tb.now().Add(-tb.cfg.KeyTTL)
-		tb.mu.Lock()
-		for k, b := range tb.buckets {
-			if b.lastSeen.Before(cutoff) {
-				delete(tb.buckets, k)
+
+	for {
+		select {
+		case <-tb.stopCh:
+			return
+		case <-ticker.C:
+			cutoff := tb.now().Add(-tb.cfg.KeyTTL)
+			tb.mu.Lock()
+			for k, b := range tb.buckets {
+				b.mu.Lock()
+				isExpired := b.lastSeen.Before(cutoff)
+				b.mu.Unlock()
+
+				if isExpired {
+					delete(tb.buckets, k)
+				}
 			}
+			tb.mu.Unlock()
 		}
-		tb.mu.Unlock()
 	}
 }
