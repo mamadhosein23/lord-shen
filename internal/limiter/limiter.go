@@ -1,169 +1,87 @@
 package limiter
 
 import (
-	"context"
-	"math"
 	"sync"
 	"time"
 )
 
-// Result نتیجه‌ی ارزیابی یک درخواست را توصیف می‌کند.
-type Result struct {
-	Allowed    bool
-	Limit      int
-	Remaining  int
-	ResetAt    time.Time
-	RetryAfter time.Duration
+// Client رکورد مربوط به تعداد درخواست‌های هر کلاینت را نگهداری می‌کند.
+type Client struct {
+	mu        sync.Mutex
+	count     int
+	resetTime time.Time
 }
 
-// Limiter قرارداد اصلی موتور نرخ‌دهی است.
-type Limiter interface {
-	Allow(ctx context.Context, key string) (Result, error)
-	Close() error
-}
-
-type bucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	lastSeen time.Time
-}
-
-// Config تنظیمات عملیاتی موتور TokenBucket است.
-type Config struct {
-	Rate         float64
-	Burst        int
-	CleanupEvery time.Duration
-	KeyTTL       time.Duration
-}
-
-// TokenBucket پیاده‌سازی هم‌روند و امن در حافظه.
-type TokenBucket struct {
-	cfg     Config
+// RateLimiter ساختار اصلی مدیریت نرخ درخواست‌هاست.
+type RateLimiter struct {
 	mu      sync.RWMutex
-	buckets map[string]*bucket
-	now     func() time.Time
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	clients map[string]*Client
+	rate    int           // حداکثر تعداد درخواست مجاز در بازه زمانی
+	window  time.Duration // طول بازه زمانی
 }
 
-// NewTokenBucket یک موتور جدید می‌سازد و پاکساز را به همراه Graceful Shutdown مقداردهی می‌کند.
-func NewTokenBucket(cfg Config) *TokenBucket {
-	if cfg.CleanupEvery <= 0 {
-		cfg.CleanupEvery = time.Minute
-	}
-	if cfg.KeyTTL <= 0 {
-		cfg.KeyTTL = 10 * time.Minute
-	}
-
-	tb := &TokenBucket{
-		cfg:     cfg,
-		buckets: make(map[string]*bucket),
-		now:     time.Now,
-		stopCh:  make(chan struct{}),
+// NewRateLimiter یک نمونه جدید از RateLimiter می‌سازد.
+func NewRateLimiter(rate int, window time.Duration) *RateLimiter {
+	limiter := &RateLimiter{
+		clients: make(map[string]*Client),
+		rate:    rate,
+		window:  window,
 	}
 
-	tb.wg.Add(1)
-	go tb.janitor()
+	// راه‌اندازی گوروتین پس‌زمینه برای پاکسازی داده‌های منقضی‌شده (جلوگیری از Memory Leak)
+	go limiter.cleanupLoop(1 * time.Minute)
 
-	return tb
+	return limiter
 }
 
-// Allow بررسی می‌کند آیا درخواست مربوط به کلید مجاز است یا خیر.
-func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
-	b := tb.getOrCreateBucket(key)
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	now := tb.now()
-	elapsed := now.Sub(b.lastSeen).Seconds()
-	b.lastSeen = now
-
-	// شارژ توکن‌ها با رعایت سقف Burst
-	b.tokens = math.Min(float64(tb.cfg.Burst), b.tokens+elapsed*tb.cfg.Rate)
-
-	if b.tokens >= 1.0 {
-		b.tokens -= 1.0
-		remaining := int(b.tokens)
-		// زمان لازم تا پر شدن کامل باکت (Burst)
-		fillDuration := time.Duration((float64(tb.cfg.Burst)-b.tokens)/tb.cfg.Rate * float64(time.Second))
-
-		return Result{
-			Allowed:    true,
-			Limit:      tb.cfg.Burst,
-			Remaining:  remaining,
-			ResetAt:    now.Add(fillDuration),
-			RetryAfter: 0,
-		}, nil
-	}
-
-	// در صورت رد شدن: محاسبه دقیق کسری تا دسترسی به ۱ توکن
-	missing := 1.0 - b.tokens
-	retry := time.Duration(missing / tb.cfg.Rate * float64(time.Second))
-
-	return Result{
-		Allowed:    false,
-		Limit:      tb.cfg.Burst,
-		Remaining:  0,
-		ResetAt:    now.Add(retry),
-		RetryAfter: retry,
-	}, nil
-}
-
-func (tb *TokenBucket) getOrCreateBucket(key string) *bucket {
-	tb.mu.RLock()
-	b, ok := tb.buckets[key]
-	tb.mu.RUnlock()
-	if ok {
-		return b
-	}
-
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	// Double-check locking جهت جلوگیری از ایجاد مجدد در ریس‌کاندیشن
-	if b, ok = tb.buckets[key]; ok {
-		return b
-	}
-
-	now := tb.now()
-	b = &bucket{
-		tokens:   float64(tb.cfg.Burst),
-		lastSeen: now,
-	}
-	tb.buckets[key] = b
-	return b
-}
-
-// Close برای جلوگیری از نشت منابع و اتمام کار گوروتین پاکساز.
-func (tb *TokenBucket) Close() error {
-	close(tb.stopCh)
-	tb.wg.Wait()
-	return nil
-}
-
-func (tb *TokenBucket) janitor() {
-	defer tb.wg.Done()
-	ticker := time.NewTicker(tb.cfg.CleanupEvery)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-tb.stopCh:
-			return
-		case <-ticker.C:
-			cutoff := tb.now().Add(-tb.cfg.KeyTTL)
-			tb.mu.Lock()
-			for k, b := range tb.buckets {
-				b.mu.Lock()
-				isExpired := b.lastSeen.Before(cutoff)
-				b.mu.Unlock()
-
-				if isExpired {
-					delete(tb.buckets, k)
-				}
-			}
-			tb.mu.Unlock()
+// Allow بررسی می‌کند آیا IP مورد نظر مجاز به ارسال درخواست است یا خیر.
+// خروجی دوم تعداد درخواست‌های باقی‌مانده و خروجی سوم زمان ریست شدن پنجره را برمی‌گرداند.
+func (rl *RateLimiter) Allow(ip string) (bool, int, time.Time) {
+	rl.mu.Lock()
+	client, exists := rl.clients[ip]
+	if !exists {
+		client = &Client{
+			resetTime: time.Now().Add(rl.window),
 		}
+		rl.clients[ip] = client
+	}
+	rl.mu.Unlock()
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+
+	now := time.Now()
+
+	// اگر بازه زمانی فعلی منقضی شده باشد، پنجره را ریست می‌کنیم
+	if now.After(client.resetTime) {
+		client.count = 0
+		client.resetTime = now.Add(rl.window)
+	}
+
+	// اگر به حد مجاز رسیده باشد
+	if client.count >= rl.rate {
+		remaining := 0
+		return false, remaining, client.resetTime
+	}
+
+	client.count++
+	remaining := rl.rate - client.count
+	return true, remaining, client.resetTime
+}
+
+// cleanupLoop به صورت دوره‌ای کلاینت‌های قدیمی را از حافظه پاک می‌کند.
+func (rl *RateLimiter) cleanupLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for ip, client :=5 client.resetTime.Before(now) {
+			client.mu.Lock()
+			if now.After(client.resetTime) {
+				delete(rl.clients, ip)
+			}
+			client.mu.Unlock()
+		}
+		rl.mu.Unlock()
 	}
 }
