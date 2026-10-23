@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Result نتیجه‌ی ارزیابی یک درخواست را توصیف می‌کند.
+// Result describes the evaluation outcome of a rate-limiting request.
 type Result struct {
 	Allowed    bool
 	Limit      int
@@ -16,7 +16,7 @@ type Result struct {
 	RetryAfter time.Duration
 }
 
-// Limiter قرارداد اصلی موتور نرخ‌دهی است.
+// Limiter defines the core interface for rate-limiting engines.
 type Limiter interface {
 	Allow(ctx context.Context, key string) (Result, error)
 	Close() error
@@ -28,7 +28,7 @@ type bucket struct {
 	lastSeen time.Time
 }
 
-// Config تنظیمات عملیاتی موتور TokenBucket است.
+// Config holds operational parameters for the TokenBucket engine.
 type Config struct {
 	Rate         float64
 	Burst        int
@@ -36,7 +36,7 @@ type Config struct {
 	KeyTTL       time.Duration
 }
 
-// TokenBucket پیاده‌سازی هم‌روند، امن و ایزوله در حافظه.
+// TokenBucket provides a concurrent-safe, isolated in-memory rate limiter using the token bucket algorithm.
 type TokenBucket struct {
 	cfg     Config
 	mu      sync.RWMutex
@@ -46,7 +46,7 @@ type TokenBucket struct {
 	wg      sync.WaitGroup
 }
 
-// NewTokenBucket یک موتور جدید می‌سازد و پاکساز را شروع می‌کند.
+// NewTokenBucket creates a new TokenBucket engine and starts the background janitor goroutine.
 func NewTokenBucket(cfg Config) *TokenBucket {
 	if cfg.CleanupEvery <= 0 {
 		cfg.CleanupEvery = time.Minute
@@ -68,7 +68,7 @@ func NewTokenBucket(cfg Config) *TokenBucket {
 	return tb
 }
 
-// Allow ارزیابی می‌کند که آیا کلید مشخص‌شده مجوز مصرف توکن را دارد یا خیر.
+// Allow evaluates whether the specified key is permitted to consume a token.
 func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
 	b := tb.getOrCreateBucket(key)
 
@@ -79,7 +79,7 @@ func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
 	elapsed := now.Sub(b.lastSeen).Seconds()
 	b.lastSeen = now
 
-	// تجدید توکن‌ها
+	// Replenish tokens based on elapsed time and generation rate
 	b.tokens = math.Min(float64(tb.cfg.Burst), b.tokens+elapsed*tb.cfg.Rate)
 
 	if b.tokens >= 1.0 {
@@ -96,7 +96,7 @@ func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
 		}, nil
 	}
 
-	// رد درخواست و بازگرداندن زمان انتظار
+	// Reject request and calculate required wait duration
 	missing := 1.0 - b.tokens
 	retry := time.Duration(missing / tb.cfg.Rate * float64(time.Second))
 
@@ -109,6 +109,7 @@ func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
 	}, nil
 }
 
+// getOrCreateBucket retrieves an existing bucket or safely creates a new one using double-checked locking.
 func (tb *TokenBucket) getOrCreateBucket(key string) *bucket {
 	tb.mu.RLock()
 	b, ok := tb.buckets[key]
@@ -132,11 +133,11 @@ func (tb *TokenBucket) getOrCreateBucket(key string) *bucket {
 	return b
 }
 
-// Close پروسه پاکسازی پس‌زمینه را به شکل ایمن متوقف می‌کند.
+// Close gracefully shuts down the background janitor cleanup process.
 func (tb *TokenBucket) Close() error {
 	select {
 	case <-tb.stopCh:
-		// از پیش بسته شده است
+		// Already closed
 		return nil
 	default:
 		close(tb.stopCh)
@@ -145,6 +146,7 @@ func (tb *TokenBucket) Close() error {
 	return nil
 }
 
+// janitor periodically purges expired buckets from memory to prevent memory leaks.
 func (tb *TokenBucket) janitor() {
 	defer tb.wg.Done()
 	ticker := time.NewTicker(tb.cfg.CleanupEvery)
