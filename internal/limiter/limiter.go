@@ -1,87 +1,47 @@
-package limiter
+package middleware
 
 import (
-	"sync"
+	"encoding/json"
+	"net"
+	"net/http"
+	"strconv"
 	"time"
+
+	"lord-shen/internal/limiter"
 )
 
-// Client رکورد مربوط به تعداد درخواست‌های هر کلاینت را نگهداری می‌کند.
-type Client struct {
-	mu        sync.Mutex
-	count     int
-	resetTime time.Time
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
 }
 
-// RateLimiter ساختار اصلی مدیریت نرخ درخواست‌هاست.
-type RateLimiter struct {
-	mu      sync.RWMutex
-	clients map[string]*Client
-	rate    int           // حداکثر تعداد درخواست مجاز در بازه زمانی
-	window  time.Duration // طول بازه زمانی
-}
-
-// NewRateLimiter یک نمونه جدید از RateLimiter می‌سازد.
-func NewRateLimiter(rate int, window time.Duration) *RateLimiter {
-	limiter := &RateLimiter{
-		clients: make(map[string]*Client),
-		rate:    rate,
-		window:  window,
-	}
-
-	// راه‌اندازی گوروتین پس‌زمینه برای پاکسازی داده‌های منقضی‌شده (جلوگیری از Memory Leak)
-	go limiter.cleanupLoop(1 * time.Minute)
-
-	return limiter
-}
-
-// Allow بررسی می‌کند آیا IP مورد نظر مجاز به ارسال درخواست است یا خیر.
-// خروجی دوم تعداد درخواست‌های باقی‌مانده و خروجی سوم زمان ریست شدن پنجره را برمی‌گرداند.
-func (rl *RateLimiter) Allow(ip string) (bool, int, time.Time) {
-	rl.mu.Lock()
-	client, exists := rl.clients[ip]
-	if !exists {
-		client = &Client{
-			resetTime: time.Now().Add(rl.window),
-		}
-		rl.clients[ip] = client
-	}
-	rl.mu.Unlock()
-
-	client.mu.Lock()
-	defer client.mu.Unlock()
-
-	now := time.Now()
-
-	// اگر بازه زمانی فعلی منقضی شده باشد، پنجره را ریست می‌کنیم
-	if now.After(client.resetTime) {
-		client.count = 0
-		client.resetTime = now.Add(rl.window)
-	}
-
-	// اگر به حد مجاز رسیده باشد
-	if client.count >= rl.rate {
-		remaining := 0
-		return false, remaining, client.resetTime
-	}
-
-	client.count++
-	remaining := rl.rate - client.count
-	return true, remaining, client.resetTime
-}
-
-// cleanupLoop به صورت دوره‌ای کلاینت‌های قدیمی را از حافظه پاک می‌کند.
-func (rl *RateLimiter) cleanupLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for ip, client :=5 client.resetTime.Before(now) {
-			client.mu.Lock()
-			if now.After(client.resetTime) {
-				delete(rl.clients, ip)
+func RateLimitMiddleware(limiter *limiter.RateLimiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// استخراج دقیق IP کلاینت (با در نظر گرفتن پراکسی‌های احتمالی مثل Nginx)
+			ip, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				ip = r.RemoteAddr
 			}
-			client.mu.Unlock()
-		}
-		rl.mu.Unlock()
+
+			allowed, remaining, resetTime := limiter.Allow(ip)
+
+			// تنظیم هدرهای استاندارد Rate Limit
+			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(100)) // مثال: حد ثابت
+			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetTime.Unix(), 10))
+
+			if !allowed {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				json.NewEncoder(w).Encode(ErrorResponse{
+					Error:   "Too Many Requests",
+					Message: "Rate limit exceeded. Please try again later.",
+				})
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
 	}
 }
