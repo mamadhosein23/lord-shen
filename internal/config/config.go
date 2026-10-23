@@ -7,15 +7,16 @@ import (
 	"time"
 )
 
+// Config holds the application configuration parameters.
 type Config struct {
-	Addr         string        // پورت یا آدرس لیسنر سرور
-	Rate         float64       // نرخ تولید توکن در ثانیه
-	Burst        int           // ظرفیت باکت
-	CleanupEvery time.Duration // بازه زمانی پاکسازی کلیدهای منقضی‌شده
-	KeyTTL       time.Duration // مدت زمان انقضای کلید
+	Addr         string        // Server listener address or port
+	Rate         float64       // Token generation rate per second (Token Bucket algorithm)
+	Burst        int           // Maximum bucket capacity for burst traffic
+	CleanupEvery time.Duration // Interval for purging expired rate-limiter keys from memory
+	KeyTTL       time.Duration // Time-to-live duration before idle keys expire
 }
 
-// Load تنظیمات را از متغیرهای محیطی خوانده و مقادیر را اعتبارسنجی می‌کند.
+// Load reads configuration values from environment variables with fallback defaults and validates them.
 func Load() (*Config, error) {
 	cfg := &Config{
 		Addr: getEnv("ADDR", ":8080"),
@@ -46,6 +47,7 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// validate ensures that all configuration parameters fall within valid logical ranges.
 func (c *Config) validate() error {
 	if c.Rate <= 0 {
 		return fmt.Errorf("rate must be greater than zero, got %f", c.Rate)
@@ -62,6 +64,7 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// getEnv retrieves a string environment variable or returns the default fallback value.
 func getEnv(key, def string) string {
 	if val, ok := os.LookupEnv(key); ok && val != "" {
 		return val
@@ -69,6 +72,7 @@ func getEnv(key, def string) string {
 	return def
 }
 
+// getEnvInt retrieves an integer environment variable or returns the default fallback value.
 func getEnvInt(key string, def int) (int, error) {
 	val, ok := os.LookupEnv(key)
 	if !ok || val == "" {
@@ -81,6 +85,7 @@ func getEnvInt(key string, def int) (int, error) {
 	return res, nil
 }
 
+// getEnvFloat retrieves a floating-point environment variable or returns the default fallback value.
 func getEnvFloat(key string, def float64) (float64, error) {
 	val, ok := os.LookupEnv(key)
 	if !ok || val == "" {
@@ -93,6 +98,7 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	return res, nil
 }
 
+// getEnvDuration retrieves a time.Duration environment variable or returns the default fallback value.
 func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	val, ok := os.LookupEnv(key)
 	if !ok || val == "" {
