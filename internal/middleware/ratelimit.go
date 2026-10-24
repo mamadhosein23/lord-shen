@@ -1,173 +1,98 @@
-package limiter
+package middleware
 
 import (
 	"context"
-	"math"
-	"sync"
+	"encoding/json"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
 	"time"
+
+	"lord-shen/internal/limiter"
+	"lord-shen/internal/metrics"
 )
 
-// Result describes the evaluation outcome of a rate-limiting request.
-type Result struct {
-	Allowed    bool
-	Limit      int
-	Remaining  int
-	ResetAt    time.Time
-	RetryAfter time.Duration
+type ErrorDetail struct {
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Status   int    `json:"status"`
+	Detail   string `json:"detail"`
+	Instance string `json:"instance"`
 }
 
-// Limiter defines the core interface for rate-limiting engines.
-type Limiter interface {
-	Allow(ctx context.Context, key string) (Result, error)
-	Close() error
-}
+// KeyExtractor defines how to derive the rate limit key from an HTTP request.
+type KeyExtractor func(r *http.Request) string
 
-type bucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	lastSeen time.Time
-}
-
-// Config holds operational parameters for the TokenBucket engine.
-type Config struct {
-	Rate         float64
-	Burst        int
-	CleanupEvery time.Duration
-	KeyTTL       time.Duration
-}
-
-// TokenBucket provides a concurrent-safe, isolated in-memory rate limiter using the token bucket algorithm.
-type TokenBucket struct {
-	cfg     Config
-	mu      sync.RWMutex
-	buckets map[string]*bucket
-	now     func() time.Time
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
-}
-
-// NewTokenBucket creates a new TokenBucket engine and starts the background janitor goroutine.
-func NewTokenBucket(cfg Config) *TokenBucket {
-	if cfg.CleanupEvery <= 0 {
-		cfg.CleanupEvery = time.Minute
+// IPKeyExtractor extracts client IP address.
+func IPKeyExtractor(r *http.Request) string {
+	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
+		return cfIP
 	}
-	if cfg.KeyTTL <= 0 {
-		cfg.KeyTTL = 10 * time.Minute
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+		return xrip
+	}
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+// APIKeyExtractor extracts key from Authorization header.
+func APIKeyExtractor(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	return IPKeyExtractor(r) // Fallback to IP
+}
+
+func RateLimitMiddleware(engine limiter.Limiter, extractor KeyExtractor, logger *slog.Logger) func(http.Handler) http.Handler {
+	if extractor == nil {
+		extractor = IPKeyExtractor
 	}
 
-	tb := &TokenBucket{
-		cfg:     cfg,
-		buckets: make(map[string]*bucket),
-		now:     time.Now,
-		stopCh:  make(chan struct{}),
-	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := extractor(r)
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
 
-	tb.wg.Add(1)
-	go tb.janitor()
-
-	return tb
-}
-
-// Allow evaluates whether the specified key is permitted to consume a token.
-func (tb *TokenBucket) Allow(_ context.Context, key string) (Result, error) {
-	b := tb.getOrCreateBucket(key)
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	now := tb.now()
-	elapsed := now.Sub(b.lastSeen).Seconds()
-	b.lastSeen = now
-
-	// Replenish tokens based on elapsed time and generation rate
-	b.tokens = math.Min(float64(tb.cfg.Burst), b.tokens+elapsed*tb.cfg.Rate)
-
-	if b.tokens >= 1.0 {
-		b.tokens -= 1.0
-		remaining := int(b.tokens)
-		fillDuration := time.Duration((float64(tb.cfg.Burst)-b.tokens)/tb.cfg.Rate * float64(time.Second))
-
-		return Result{
-			Allowed:    true,
-			Limit:      tb.cfg.Burst,
-			Remaining:  remaining,
-			ResetAt:    now.Add(fillDuration),
-			RetryAfter: 0,
-		}, nil
-	}
-
-	// Reject request and calculate required wait duration
-	missing := 1.0 - b.tokens
-	retry := time.Duration(missing / tb.cfg.Rate * float64(time.Second))
-
-	return Result{
-		Allowed:    false,
-		Limit:      tb.cfg.Burst,
-		Remaining:  0,
-		ResetAt:    now.Add(retry),
-		RetryAfter: retry,
-	}, nil
-}
-
-// getOrCreateBucket retrieves an existing bucket or safely creates a new one using double-checked locking.
-func (tb *TokenBucket) getOrCreateBucket(key string) *bucket {
-	tb.mu.RLock()
-	b, ok := tb.buckets[key]
-	tb.mu.RUnlock()
-	if ok {
-		return b
-	}
-
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	if b, ok = tb.buckets[key]; ok {
-		return b
-	}
-
-	b = &bucket{
-		tokens:   float64(tb.cfg.Burst),
-		lastSeen: tb.now(),
-	}
-	tb.buckets[key] = b
-	return b
-}
-
-// Close gracefully shuts down the background janitor cleanup process.
-func (tb *TokenBucket) Close() error {
-	select {
-	case <-tb.stopCh:
-		// Already closed
-		return nil
-	default:
-		close(tb.stopCh)
-	}
-	tb.wg.Wait()
-	return nil
-}
-
-// janitor periodically purges expired buckets from memory to prevent memory leaks.
-func (tb *TokenBucket) janitor() {
-	defer tb.wg.Done()
-	ticker := time.NewTicker(tb.cfg.CleanupEvery)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-tb.stopCh:
-			return
-		case <-ticker.C:
-			cutoff := tb.now().Add(-tb.cfg.KeyTTL)
-
-			tb.mu.Lock()
-			for k, b := range tb.buckets {
-				b.mu.Lock()
-				if b.lastSeen.Before(cutoff) {
-					delete(tb.buckets, k)
-				}
-				b.mu.Unlock()
+			result, err := engine.Allow(ctx, key)
+			if err != nil {
+				logger.Error("rate limiter internal error (fail-open)", slog.String("error", err.Error()))
+				metrics.IncError()
+				next.ServeHTTP(w, r) // Fail-Open policy
+				return
 			}
-			tb.mu.Unlock()
-		}
+
+			// Set IETF standard headers
+			w.Header().Set("RateLimit-Limit", string(rune(result.Limit)))
+			// (در تولید از strconv.Itoa استفاده می‌شود)
+
+			if !result.Allowed {
+				metrics.IncBlocked()
+				w.Header().Set("Retry-After", result.RetryAfter.String())
+				w.WriteHeader(http.StatusTooManyRequests)
+				
+				problem := ErrorDetail{
+					Type:     "https://datatracker.ietf.org/doc/html/rfc7807",
+					Title:    "Too Many Requests",
+					Status:   http.StatusTooManyRequests,
+					Detail:   "Rate limit exceeded. Please try again later.",
+					Instance: r.URL.Path,
+				}
+				_ = json.NewEncoder(w).Encode(problem)
+				return
+			}
+
+			metrics.IncAllowed()
+			next.ServeHTTP(w, r)
+		})
 	}
 }
