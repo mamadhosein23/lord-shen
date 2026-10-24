@@ -1,96 +1,91 @@
-package middleware
+package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"log/slog"
-	"net"
 	"net/http"
-	"strings"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"lord-shen/internal/config"
 	"lord-shen/internal/limiter"
+	"lord-shen/internal/middleware"
 )
 
-// LimiterEngine defines the interface for underlying rate-limiting engines.
-type LimiterEngine interface {
-	Allow(ctx context.Context, key string) (limiter.Result, error)
-}
+func main() {
+	// Initialize structured JSON logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 
-// RateLimitMiddleware creates an HTTP middleware that enforces rate limiting 
-// based on standard IETF/RFC rate limit headers and Fail-Open reliability.
-func RateLimitMiddleware(engine LimiterEngine, logger *slog.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			clientIP := extractRealIP(r)
-			
-			// Enforce a strict timeout for the rate-limiting evaluation to protect latency
-			ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
-			defer cancel()
-
-			res, err := engine.Allow(ctx, clientIP)
-			if err != nil {
-				// Log the internal error but apply Fail-Open: do not block traffic due to limiter failure
-				logger.Error("rate limiter internal error", "ip", clientIP, "error", err)
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			// Set standard IETF RateLimit headers for client integration
-			w.Header().Set("RateLimit-Limit", fmt.Sprintf("%d", res.Limit))
-			w.Header().Set("RateLimit-Remaining", fmt.Sprintf("%d", res.Remaining))
-			w.Header().Set("RateLimit-Reset", fmt.Sprintf("%d", res.ResetAt.Unix()))
-
-			if !res.Allowed {
-				retryAfterSeconds := int(res.RetryAfter.Seconds())
-				if retryAfterSeconds <= 0 {
-					retryAfterSeconds = 1
-				}
-				
-				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSeconds))
-				w.Header().Set("Content-Type", "application/problem+json")
-				w.WriteHeader(http.StatusTooManyRequests)
-
-				// Structured error response compliant with RFC 7807 (Problem Details for HTTP APIs)
-				payload := map[string]any{
-					"type":        "https://httpstatuses.com/429",
-					"title":       "Too Many Requests",
-					"status":      http.StatusTooManyRequests,
-					"detail":      "Rate limit exceeded. Please try again later.",
-					"retry_after": retryAfterSeconds,
-				}
-				_ = json.NewEncoder(w).Encode(payload)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// extractRealIP accurately extracts the client's real IP address behind proxies, load balancers, and CDNs (e.g., Cloudflare).
-func extractRealIP(r *http.Request) string {
-	// Check Cloudflare specific connecting IP header
-	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
-		return strings.TrimSpace(cfIP)
-	}
-	// Check standard X-Real-IP header
-	if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
-		return strings.TrimSpace(xRealIP)
-	}
-	// Check X-Forwarded-For chain and extract the first client IP
-	if xForwardedFor := r.Header.Get("X-Forwarded-For"); xForwardedFor != "" {
-		parts := strings.Split(xForwardedFor, ",")
-		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
-			return strings.TrimSpace(parts[0])
-		}
-	}
-	
-	// Fallback to RemoteAddr if no proxy headers are present
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	// Load configuration from environment variables
+	cfg, err := config.Load()
 	if err != nil {
-		return r.RemoteAddr
+		logger.Error("failed to load configuration", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
-	return ip
+
+	// Initialize the TokenBucket engine
+	engine := limiter.NewTokenBucket(limiter.Config{
+		Rate:         cfg.Rate,
+		Burst:        cfg.Burst,
+		CleanupEvery: cfg.CleanupEvery,
+		KeyTTL:       cfg.KeyTTL,
+	})
+
+	// Setup application router and apply rate limiting middleware
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("GET /api/v1/resource", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"message":"access granted"}`))
+	})
+
+	handler := middleware.RateLimitMiddleware(engine, logger)(mux)
+
+	// Configure HTTP server with production-grade timeouts
+	server := &http.Server{
+		Addr:         cfg.Addr,
+		Handler:      handler,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Listen for OS signals for graceful shutdown
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		logger.Info("starting server", slog.String("addr", cfg.Addr), slog.Float64("rate", cfg.Rate), slog.Int("burst", cfg.Burst))
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("server listener encountered an error", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for termination signal
+	<-shutdownCh
+	logger.Info("shutting down server gracefully...")
+
+	// Create timeout context for server and limiter drain
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("server shutdown failed", slog.String("error", err.Error()))
+	}
+
+	// Terminate background cleanup janitor
+	if err := engine.Close(); err != nil {
+		logger.Error("limiter shutdown failed", slog.String("error", err.Error()))
+	}
+
+	logger.Info("server and limiter engine terminated cleanly")
 }
