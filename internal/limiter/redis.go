@@ -2,95 +2,85 @@ package limiter
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const redisLuaScript = `
+// RedisTokenBucketLimiter evaluates limits using atomic Redis Lua scripts.
+type RedisTokenBucketLimiter struct {
+	client *redis.Client
+	script *redis.Script
+}
+
+// Lua script to enforce atomic Token Bucket algorithm
+// KEYS[1]: Token bucket state key
+// ARGV[1]: Max tokens capacity
+// ARGV[2]: Refill rate per millisecond
+// ARGV[3]: Current timestamp in unix milliseconds
+// ARGV[4]: Requested tokens (usually 1)
+const tokenBucketLua = `
 local key = KEYS[1]
-local limit = tonumber(ARGV[1])
-local window = tonumber(ARGV[2])
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
 
-local clearBefore = now - window
-redis.call('ZREMRANGEBYSCORE', key, 0, clearBefore)
+local state = redis.call("HMGET", key, "tokens", "last_updated")
+local tokens = tonumber(state[1])
+local last_updated = tonumber(state[2])
 
-local currentRequests = redis.call('ZCARD', key)
-if currentRequests < limit then
-    redis.call('ZADD', key, now, now .. '-' .. math.random(100000))
-    redis.call('EXPIRE', key, math.ceil(window))
-    return {1, limit - currentRequests - 1, now + window}
+if not tokens then
+    tokens = capacity
+    last_updated = now
 else
-    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-    local resetTime = tonumber(oldest[2]) + window
-    return {0, 0, resetTime}
+    local delta = math.max(0, now - last_updated)
+    local generated = delta * refill_rate
+    tokens = math.min(capacity, tokens + generated)
+    last_updated = now
+end
+
+if tokens >= requested then
+    tokens = tokens - requested
+    redis.call("HMSET", key, "tokens", tokens, "last_updated", last_updated)
+    -- Expire bucket if inactive for full refill duration + safety margin
+    local ttl = math.ceil((capacity / refill_rate) / 1000) + 60
+    redis.call("EXPIRE", key, ttl)
+    return {1, math.floor(tokens), 0}
+else
+    local wait_time_ms = math.ceil((requested - tokens) / refill_rate)
+    return {0, math.floor(tokens), wait_time_ms}
 end
 `
 
-type RedisLimiter struct {
-	client *redis.Client
-	limit  int
-	window time.Duration
-	sha    string
-}
-
-func NewRedisLimiter(client *redis.Client, limit int, window time.Duration) *RedisLimiter {
-	h := sha1.New()
-	h.Write([]byte(redisLuaScript))
-	sha := hex.EncodeToString(h.Sum(nil))
-
-	return &RedisLimiter{
+func NewRedisLimiter(client *redis.Client) *RedisTokenBucketLimiter {
+	return &RedisTokenBucketLimiter{
 		client: client,
-		limit:  limit,
-		window: window,
-		sha:    sha,
+		script: redis.NewScript(tokenBucketLua),
 	}
 }
 
-func (r *RedisLimiter) Allow(ctx context.Context, key string) (Result, error) {
-	now := time.Now().UnixNano() / int64(time.Millisecond)
-	windowMs := r.window.Milliseconds()
+// Allow checks if the request is permitted.
+// capacity: max burst capacity.
+// ratePerSecond: sustained allowed requests per second.
+func (r *RedisTokenBucketLimiter) Allow(ctx context.Context, key string, capacity int64, ratePerSecond float64) (allowed bool, remaining int64, retryAfter time.Duration, err error) {
+	nowMs := time.Now().UnixNano() / int64(time.Millisecond)
+	refillRatePerMs := ratePerSecond / 1000.0
 
-	res, err := r.client.EvalSha(ctx, r.sha, []string{key}, r.limit, windowMs, now).Result()
+	res, err := r.script.Run(ctx, r.client, []string{"rl:" + key}, capacity, refillRatePerMs, nowMs, 1).Result()
 	if err != nil {
-		// Fallback or load script if SHA not found on Redis server
-		res, err = r.client.Eval(ctx, redisLuaScript, []string{key}, r.limit, windowMs, now).Result()
-		if err != nil {
-			return Result{}, fmt.Errorf("redis eval failed: %w", err)
-		}
+		return false, 0, 0, fmt.Errorf("redis limiter execution failed: %w", err)
 	}
 
-	arr, ok := res.([]interface{})
-	if !ok || len(arr) < 3 {
-		return Result{}, fmt.Errorf("unexpected redis response format")
+	values, ok := res.([]interface{})
+	if !ok || len(values) < 3 {
+		return false, 0, 0, fmt.Errorf("unexpected script output")
 	}
 
-	allowed := arr[0].(int64) == 1
-	remaining := int(arr[1].(int64))
-	resetMs := arr[2].(int64)
-	resetAt := time.Unix(0, resetMs*int64(time.Millisecond))
+	isAllowed := values[0].(int64) == 1
+	tokensLeft := values[1].(int64)
+	waitMs := values[2].(int64)
 
-	var retryAfter time.Duration
-	if !allowed {
-		retryAfter = time.Until(resetAt)
-		if retryAfter < 0 {
-			retryAfter = 0
-		}
-	}
-
-	return Result{
-		Allowed:    allowed,
-		Limit:      r.limit,
-		Remaining:  remaining,
-		ResetAt:    resetAt,
-		RetryAfter: retryAfter,
-	}, nil
-}
-
-func (r *RedisLimiter) Close() error {
-	return r.client.Close()
+	return isAllowed, tokensLeft, time.Duration(waitMs) * time.Millisecond, nil
 }
