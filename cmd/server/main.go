@@ -3,89 +3,93 @@ package main
 import (
 	"context"
 	"errors"
-	"log/slog"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"lord-shen/internal/config"
-	"lord-shen/internal/limiter"
-	"lord-shen/internal/middleware"
+	"github.com/mamadhosein23/lord-shen/internal/limiter"
+	"github.com/mamadhosein23/lord-shen/internal/middleware"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-	// Initialize structured JSON logger
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
-	// Load configuration from environment variables
-	cfg, err := config.Load()
-	if err != nil {
-		logger.Error("failed to load configuration", slog.String("error", err.Error()))
-		os.Exit(1)
+	// 1. Initialize Redis Client with production pooling
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
 	}
 
-	// Initialize the TokenBucket engine
-	engine := limiter.NewTokenBucket(limiter.Config{
-		Rate:         cfg.Rate,
-		Burst:        cfg.Burst,
-		CleanupEvery: cfg.CleanupEvery,
-		KeyTTL:       cfg.KeyTTL,
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         redisAddr,
+		PoolSize:     50,
+		MinIdleConns: 10,
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second,
+	})
+	defer rdb.Close()
+
+	// Verify Redis Ping
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelPing()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		log.Printf("[WARN] Redis unreachable at start: %v. Running in degraded state.", err)
+	}
+
+	// 2. Setup Limiter Engine
+	redisLimiter := limiter.NewRedisLimiter(rdb)
+
+	limiterMw := middleware.RateLimit(redisLimiter, middleware.RateLimitConfig{
+		Capacity:      20,  // Max burst
+		RatePerSecond: 5.0, // Sustained rate
 	})
 
-	// Setup application router and apply rate limiting middleware
+	// 3. Setup Routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
-	})
-	mux.HandleFunc("GET /api/v1/resource", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":"access granted"}`))
+		_, _ = w.Write([]byte("OK"))
 	})
 
-	handler := middleware.RateLimitMiddleware(engine, logger)(mux)
+	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","message":"Request permitted by Lord Shen"}`))
+	})
 
-	// Configure HTTP server with production-grade timeouts
-	server := &http.Server{
-		Addr:         cfg.Addr,
-		Handler:      handler,
+	mux.Handle("/api/v1/resource", limiterMw(apiHandler))
+
+	// 4. HTTP Server Configuration
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
-	// Listen for OS signals for graceful shutdown
-	shutdownCh := make(chan os.Signal, 1)
-	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
+	// 5. Graceful Shutdown Listener
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	go func() {
-		logger.Info("starting server", slog.String("addr", cfg.Addr), slog.Float64("rate", cfg.Rate), slog.Int("burst", cfg.Burst))
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("server listener encountered an error", slog.String("error", err.Error()))
-			os.Exit(1)
+		log.Printf("Lord-Shen service starting on %s ...", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Server failed: %v", err)
 		}
 	}()
 
-	// Wait for termination signal
-	<-shutdownCh
-	logger.Info("shutting down server gracefully...")
+	<-stopCtx.Done()
+	log.Println("Shutdown signal received. Initiating graceful shutdown...")
 
-	// Create timeout context for server and limiter drain
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
 
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("server shutdown failed", slog.String("error", err.Error()))
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced shutdown: %v", err)
 	}
 
-	// Terminate background cleanup janitor
-	if err := engine.Close(); err != nil {
-		logger.Error("limiter shutdown failed", slog.String("error", err.Error()))
-	}
-
-	logger.Info("server and limiter engine terminated cleanly")
+	log.Println("Lord-Shen exited cleanly.")
 }
