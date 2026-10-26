@@ -1,43 +1,60 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// Config holds the application configuration parameters.
+// Config holds the application configuration parameters for HTTP and Limiter engines.
 type Config struct {
-	Addr         string        // Server listener address or port
-	Rate         float64       // Token generation rate per second (Token Bucket algorithm)
-	Burst        int           // Maximum bucket capacity for burst traffic
-	CleanupEvery time.Duration // Interval for purging expired rate-limiter keys from memory
-	KeyTTL       time.Duration // Time-to-live duration before idle keys expire
+	Addr            string        // Server listener address (e.g., ":8080" or "0.0.0.0:8080")
+	RedisAddr       string        // Redis host:port
+	Rate            float64       // Token generation rate per second
+	Burst           int           // Maximum bucket capacity
+	KeyTTL          time.Duration // Time-to-live duration before idle limiter keys expire
+	ShutdownTimeout time.Duration // Graceful shutdown context timeout
 }
 
-// Load reads configuration values from environment variables with fallback defaults and validates them.
+// Load reads and validates configuration parameters from environment variables.
 func Load() (*Config, error) {
+	var errs []error
+
+	rate, err := getEnvFloat("RATE", 5.0)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("RATE: %w", err))
+	}
+
+	burst, err := getEnvInt("BURST", 20)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("BURST: %w", err))
+	}
+
+	keyTTL, err := getEnvDuration("KEY_TTL", 10*time.Minute)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("KEY_TTL: %w", err))
+	}
+
+	shutdownTimeout, err := getEnvDuration("SHUTDOWN_TIMEOUT", 5*time.Second)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+
 	cfg := &Config{
-		Addr: getEnv("ADDR", ":8080"),
-	}
-
-	var err error
-
-	if cfg.Rate, err = getEnvFloat("RATE", 5.0); err != nil {
-		return nil, fmt.Errorf("invalid RATE: %w", err)
-	}
-
-	if cfg.Burst, err = getEnvInt("BURST", 10); err != nil {
-		return nil, fmt.Errorf("invalid BURST: %w", err)
-	}
-
-	if cfg.CleanupEvery, err = getEnvDuration("CLEANUP_EVERY", time.Minute); err != nil {
-		return nil, fmt.Errorf("invalid CLEANUP_EVERY: %w", err)
-	}
-
-	if cfg.KeyTTL, err = getEnvDuration("KEY_TTL", 10*time.Minute); err != nil {
-		return nil, fmt.Errorf("invalid KEY_TTL: %w", err)
+		Addr:            getEnv("ADDR", ":8080"),
+		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
+		Rate:            rate,
+		Burst:           burst,
+		KeyTTL:          keyTTL,
+		ShutdownTimeout: shutdownTimeout,
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -47,66 +64,83 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// validate ensures that all configuration parameters fall within valid logical ranges.
+// validate ensures all configuration parameters fall within safe production limits.
 func (c *Config) validate() error {
+	var errs []error
+
 	if c.Rate <= 0 {
-		return fmt.Errorf("rate must be greater than zero, got %f", c.Rate)
+		errs = append(errs, fmt.Errorf("rate must be > 0, got %f", c.Rate))
 	}
 	if c.Burst <= 0 {
-		return fmt.Errorf("burst must be greater than zero, got %d", c.Burst)
+		errs = append(errs, fmt.Errorf("burst must be > 0, got %d", c.Burst))
 	}
-	if c.CleanupEvery <= 0 {
-		return fmt.Errorf("cleanup interval must be positive")
+
+	// Token bucket consistency check: TTL must be longer than full refill time
+	if c.Rate > 0 && c.Burst > 0 {
+		minRefillDuration := time.Duration((float64(c.Burst)/c.Rate)*float64(time.Second))
+		if c.KeyTTL < minRefillDuration {
+			errs = append(errs, fmt.Errorf("key_ttl (%v) must be >= bucket refill time (%v)", c.KeyTTL, minRefillDuration))
+		}
 	}
-	if c.KeyTTL <= 0 {
-		return fmt.Errorf("key TTL must be positive")
+
+	if c.ShutdownTimeout <= 0 {
+		errs = append(errs, errors.New("shutdown_timeout must be positive"))
 	}
-	return nil
+
+	// Fast validation for TCP address format
+	if _, _, err := net.SplitHostPort(ensurePortColon(c.Addr)); err != nil {
+		errs = append(errs, fmt.Errorf("invalid listener addr %q: %w", c.Addr, err))
+	}
+
+	return errors.Join(errs...)
 }
 
-// getEnv retrieves a string environment variable or returns the default fallback value.
+func ensurePortColon(addr string) string {
+	if !strings.Contains(addr, ":") {
+		return ":" + addr
+	}
+	return addr
+}
+
 func getEnv(key, def string) string {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		return val
+	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
+		return strings.TrimSpace(val)
 	}
 	return def
 }
 
-// getEnvInt retrieves an integer environment variable or returns the default fallback value.
 func getEnvInt(key string, def int) (int, error) {
 	val, ok := os.LookupEnv(key)
-	if !ok || val == "" {
+	if !ok || strings.TrimSpace(val) == "" {
 		return def, nil
 	}
-	res, err := strconv.Atoi(val)
+	res, err := strconv.Atoi(strings.TrimSpace(val))
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("invalid int: %w", err)
 	}
 	return res, nil
 }
 
-// getEnvFloat retrieves a floating-point environment variable or returns the default fallback value.
 func getEnvFloat(key string, def float64) (float64, error) {
 	val, ok := os.LookupEnv(key)
-	if !ok || val == "" {
+	if !ok || strings.TrimSpace(val) == "" {
 		return def, nil
 	}
-	res, err := strconv.ParseFloat(val, 64)
+	res, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("invalid float: %w", err)
 	}
 	return res, nil
 }
 
-// getEnvDuration retrieves a time.Duration environment variable or returns the default fallback value.
 func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	val, ok := os.LookupEnv(key)
-	if !ok || val == "" {
+	if !ok || strings.TrimSpace(val) == "" {
 		return def, nil
 	}
-	res, err := time.ParseDuration(val)
+	res, err := time.ParseDuration(strings.TrimSpace(val))
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("invalid duration: %w", err)
 	}
 	return res, nil
 }
