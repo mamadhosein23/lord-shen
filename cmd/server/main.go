@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,14 +31,30 @@ type Config struct {
 }
 
 func main() {
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC|log.Lmicroseconds)
+	logger := log.New(
+		os.Stdout,
+		"",
+		log.LstdFlags|log.LUTC|log.Lmicroseconds,
+	)
 
+	if err := run(logger); err != nil {
+		// run برگشته است؛ بنابراین deferهای آن، از جمله بستن Redis، اجرا شده‌اند.
+		logger.Printf("[ERROR] Lord-Shen stopped: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *log.Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
-		logger.Fatalf("[FATAL] config error: %v", err)
+		return fmt.Errorf("config: %w", err)
 	}
 
-	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 	defer stop()
 
 	rdb := redis.NewClient(&redis.Options{
@@ -51,35 +71,59 @@ func main() {
 	})
 	defer func() {
 		if err := rdb.Close(); err != nil {
-			logger.Printf("[WARN] error closing redis: %v", err)
+			logger.Printf("[WARN] closing Redis: %v", err)
 		}
 	}()
 
-	if err := pingRedis(rootCtx, rdb, 2*time.Second); err != nil {
-		logger.Printf("[WARN] redis ping failed at startup: %v (service will start; /readyz will fail until redis is back)", err)
+	if err := pingRedis(signalCtx, rdb, 2*time.Second); err != nil {
+		logger.Printf(
+			"[WARN] Redis ping failed at startup: %v; /readyz will fail until Redis is available",
+			err,
+		)
+	}
+
+	if signalCtx.Err() != nil {
+		logger.Println("shutdown signal received during startup")
+		return nil
 	}
 
 	redisLimiter := limiter.NewRedisLimiter(rdb)
-	limiterMw := middleware.RateLimit(redisLimiter, middleware.RateLimitConfig{
-		Capacity:      cfg.Capacity,
-		RatePerSecond: cfg.RatePerSecond,
-	})
+	limiterMw := middleware.RateLimit(
+		redisLimiter,
+		middleware.RateLimitConfig{
+			Capacity:      cfg.Capacity,
+			RatePerSecond: cfg.RatePerSecond,
+		},
+	)
 
+	var draining atomic.Bool
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ok",
+		})
 	})
 
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if err := pingRedis(r.Context(), rdb, 800*time.Millisecond); err != nil {
+		if draining.Load() {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"status": "not_ready",
-				"redis":  err.Error(),
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
+
+		if err := pingRedis(r.Context(), rdb, 800*time.Millisecond); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"status": "not_ready",
+				"redis":  "unavailable",
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ready",
+		})
 	})
 
 	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +133,11 @@ func main() {
 		})
 	})
 
-	mux.Handle("/api/v1/resource", limiterMw(withBasicAccessLog(logger, apiHandler)))
+	// Access log بیرون از limiter است تا پاسخ‌های ردشده، از جمله 429، ثبت شوند.
+	mux.Handle(
+		"/api/v1/resource",
+		withBasicAccessLog(logger, limiterMw(apiHandler)),
+	)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -98,144 +146,269 @@ func main() {
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		// BaseContext حذف شد تا هنگام شات‌داون ریکوئست‌های فعال Cancel نشوند
+		// کانتکست درخواست‌های فعال را به signalCtx متصل نمی‌کنیم.
 	}
 
-	errCh := make(chan error, 1)
+	// خطای bind را پیش از شروع گوروتین تشخیص می‌دهیم.
+	listener, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
+	}
+
+	serveErrCh := make(chan error, 1)
 	go func() {
-		logger.Printf("Lord-Shen starting on %s", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-		close(errCh)
+		logger.Printf("Lord-Shen starting on %s", listener.Addr())
+		serveErrCh <- srv.Serve(listener)
 	}()
 
+	var serveErr error
+	serveResultReceived := false
+
 	select {
-	case <-rootCtx.Done():
+	case <-signalCtx.Done():
 		logger.Println("shutdown signal received")
-	case err := <-errCh:
-		if err != nil {
-			logger.Fatalf("server failed to start: %v", err)
+		// رفتار پیش‌فرض سیگنال‌ها را برمی‌گردانیم؛ سیگنال دوم می‌تواند
+		// فرایندِ منتظرِ graceful shutdown را متوقف کند.
+		stop()
+
+	case err := <-serveErrCh:
+		serveResultReceived = true
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr = fmt.Errorf("HTTP server: %w", err)
+			logger.Printf("[ERROR] %v", serveErr)
 		}
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer cancel()
-
+	draining.Store(true)
 	srv.SetKeepAlivesEnabled(false)
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Printf("[WARN] graceful shutdown failed: %v; forcing close", err)
-		_ = srv.Close()
+	shutdownCtx, cancel := context.WithTimeout(
+		context.Background(),
+		cfg.ShutdownTimeout,
+	)
+	defer cancel()
+
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		logger.Printf(
+			"[WARN] graceful shutdown failed: %v; forcing close",
+			shutdownErr,
+		)
+		if err := srv.Close(); err != nil {
+			logger.Printf("[WARN] forcing HTTP server close: %v", err)
+		}
 	}
 
-	// صبر برای خروج تمیز گوروتین ListenAndServe
-	<-errCh
+	// فقط وقتی نتیجه را در select نگرفته‌ایم، کانال را دوباره می‌خوانیم.
+	if !serveResultReceived {
+		if err := <-serveErrCh; err != nil &&
+			!errors.Is(err, http.ErrServerClosed) &&
+			serveErr == nil {
+			serveErr = fmt.Errorf("HTTP server: %w", err)
+		}
+	}
+
+	if shutdownErr != nil {
+		return errors.Join(
+			serveErr,
+			fmt.Errorf("HTTP shutdown: %w", shutdownErr),
+		)
+	}
+	if serveErr != nil {
+		return serveErr
+	}
+
 	logger.Println("Lord-Shen exited cleanly")
+	return nil
 }
 
 func loadConfig() (Config, error) {
-	capVal, err := envInt("RATE_LIMIT_CAPACITY", 20)
+	capacity, err := envInt("RATE_LIMIT_CAPACITY", 20)
 	if err != nil {
 		return Config{}, err
 	}
-	if capVal <= 0 {
+	if capacity <= 0 {
 		return Config{}, fmt.Errorf("RATE_LIMIT_CAPACITY must be > 0")
 	}
 
-	rpsVal, err := envFloat("RATE_LIMIT_RPS", 5.0)
+	rps, err := envFloat("RATE_LIMIT_RPS", 5.0)
 	if err != nil {
 		return Config{}, err
 	}
-	if rpsVal <= 0 {
-		return Config{}, fmt.Errorf("RATE_LIMIT_RPS must be > 0")
+	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+		return Config{}, fmt.Errorf("RATE_LIMIT_RPS must be finite and > 0")
 	}
 
-	timeoutVal, err := envDuration("SHUTDOWN_TIMEOUT", 5*time.Second)
+	shutdownTimeout, err := envDuration(
+		"SHUTDOWN_TIMEOUT",
+		5*time.Second,
+	)
 	if err != nil {
 		return Config{}, err
+	}
+	if shutdownTimeout <= 0 {
+		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be > 0")
 	}
 
 	return Config{
 		HTTPAddr:        envString("HTTP_ADDR", ":8080"),
 		RedisAddr:       envString("REDIS_ADDR", "localhost:6379"),
-		Capacity:        capVal,
-		RatePerSecond:   rpsVal,
-		ShutdownTimeout: timeoutVal,
+		Capacity:        capacity,
+		RatePerSecond:   rps,
+		ShutdownTimeout: shutdownTimeout,
 	}, nil
 }
 
-func pingRedis(ctx context.Context, rdb *redis.Client, timeout time.Duration) error {
+func pingRedis(
+	ctx context.Context,
+	rdb *redis.Client,
+	timeout time.Duration,
+) error {
 	pingCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
 	return rdb.Ping(pingCtx).Err()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// پس از WriteHeader دیگر نمی‌توان status پاسخ را عوض کرد.
+		log.Printf("[WARN] writing JSON response: %v", err)
+	}
 }
 
 type statusResponseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	wroteHeader bool
 }
 
-func (lrw *statusResponseWriter) WriteHeader(code int) {
-	lrw.statusCode = code
-	lrw.ResponseWriter.WriteHeader(code)
+func (w *statusResponseWriter) WriteHeader(code int) {
+	// پاسخ‌های اطلاع‌رسانی مانند 100 و 103، وضعیت نهایی نیستند.
+	// 101 را برای سناریوی ارتقای پروتکل نگه می‌داریم.
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+
+	if w.wroteHeader {
+		return
+	}
+
+	w.statusCode = code
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(code)
 }
 
-func withBasicAccessLog(logger *log.Logger, next http.Handler) http.Handler {
+func (w *statusResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap به http.ResponseController اجازه می‌دهد قابلیت‌های writer اصلی
+// مانند Flush و Hijack را پیدا کند.
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *statusResponseWriter) FlushError() error {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *statusResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *statusResponseWriter) Hijack() (
+	net.Conn,
+	*bufio.ReadWriter,
+	error,
+) {
+	conn, rw, err := http.NewResponseController(
+		w.ResponseWriter,
+	).Hijack()
+	if err == nil && !w.wroteHeader {
+		w.statusCode = http.StatusSwitchingProtocols
+		w.wroteHeader = true
+	}
+	return conn, rw, err
+}
+
+func withBasicAccessLog(
+	logger *log.Logger,
+	next http.Handler,
+) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		wrapped := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		wrapped := &statusResponseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+		}
+
 		next.ServeHTTP(wrapped, r)
-		logger.Printf("status=%d method=%s path=%s remote=%s dur=%s",
-			wrapped.statusCode, r.Method, r.URL.Path, r.RemoteAddr, time.Since(start))
+
+		logger.Printf(
+			"status=%d method=%s path=%s remote=%s ua=%q dur=%s",
+			wrapped.statusCode,
+			r.Method,
+			r.URL.Path,
+			r.RemoteAddr,
+			r.UserAgent(),
+			time.Since(start),
+		)
 	})
 }
 
 func envString(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return def
 }
 
 func envInt(key string, def int) (int, error) {
-	v := os.Getenv(key)
-	if v == "" {
+	value := os.Getenv(key)
+	if value == "" {
 		return def, nil
 	}
-	n, err := strconv.Atoi(v)
+
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		return 0, fmt.Errorf("invalid int for %s: %w", key, err)
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
 	}
-	return n, nil
+	return parsed, nil
 }
 
 func envFloat(key string, def float64) (float64, error) {
-	v := os.Getenv(key)
-	if v == "" {
+	value := os.Getenv(key)
+	if value == "" {
 		return def, nil
 	}
-	f, err := strconv.ParseFloat(v, 64)
+
+	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid float for %s: %w", key, err)
+		return 0, fmt.Errorf("%s must be a float: %w", key, err)
 	}
-	return f, nil
+	return parsed, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {
-	v := os.Getenv(key)
-	if v == "" {
+	value := os.Getenv(key)
+	if value == "" {
 		return def, nil
 	}
-	d, err := time.ParseDuration(v)
+
+	parsed, err := time.ParseDuration(value)
 	if err != nil {
-		return 0, fmt.Errorf("invalid duration for %s: %w", key, err)
+		return 0, fmt.Errorf("%s must be a duration: %w", key, err)
 	}
-	return d, nil
+	return parsed, nil
 }
