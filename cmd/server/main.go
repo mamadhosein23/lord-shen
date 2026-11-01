@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,7 +37,6 @@ func main() {
 	)
 
 	if err := run(logger); err != nil {
-		// run برگشته است؛ بنابراین deferهای آن، از جمله بستن Redis، اجرا شده‌اند.
 		logger.Printf("[ERROR] Lord-Shen stopped: %v", err)
 		os.Exit(1)
 	}
@@ -76,10 +74,7 @@ func run(logger *log.Logger) error {
 	}()
 
 	if err := pingRedis(signalCtx, rdb, 2*time.Second); err != nil {
-		logger.Printf(
-			"[WARN] Redis ping failed at startup: %v; /readyz will fail until Redis is available",
-			err,
-		)
+		logger.Printf("[WARN] Redis initial ping failed: %v", err)
 	}
 
 	if signalCtx.Err() != nil {
@@ -99,41 +94,35 @@ func run(logger *log.Logger) error {
 	var draining atomic.Bool
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "ok",
-		})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if draining.Load() {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-				"status": "not_ready",
-			})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
 			return
 		}
 
-		if err := pingRedis(r.Context(), rdb, 800*time.Millisecond); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		// کانتکست مستقل برای جلوگیری از تاثیر لغو درخواست کلاینت روی نتیجه بررسی ردیس
+		if err := pingRedis(context.Background(), rdb, 800*time.Millisecond); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"status": "not_ready",
 				"redis":  "unavailable",
 			})
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "ready",
-		})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
 	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSON(w, http.StatusOK, map[string]string{
 			"status":  "success",
 			"message": "Request permitted by Lord Shen",
 		})
 	})
 
-	// Access log بیرون از limiter است تا پاسخ‌های ردشده، از جمله 429، ثبت شوند.
 	mux.Handle(
 		"/api/v1/resource",
 		withBasicAccessLog(logger, limiterMw(apiHandler)),
@@ -143,13 +132,9 @@ func run(logger *log.Logger) error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		// کانتکست درخواست‌های فعال را به signalCtx متصل نمی‌کنیم.
 	}
 
-	// خطای bind را پیش از شروع گوروتین تشخیص می‌دهیم.
 	listener, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
@@ -162,15 +147,11 @@ func run(logger *log.Logger) error {
 	}()
 
 	var serveErr error
-	serveResultReceived := false
+	var serveResultReceived bool
 
 	select {
 	case <-signalCtx.Done():
 		logger.Println("shutdown signal received")
-		// رفتار پیش‌فرض سیگنال‌ها را برمی‌گردانیم؛ سیگنال دوم می‌تواند
-		// فرایندِ منتظرِ graceful shutdown را متوقف کند.
-		stop()
-
 	case err := <-serveErrCh:
 		serveResultReceived = true
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -182,37 +163,25 @@ func run(logger *log.Logger) error {
 	draining.Store(true)
 	srv.SetKeepAlivesEnabled(false)
 
-	shutdownCtx, cancel := context.WithTimeout(
-		context.Background(),
-		cfg.ShutdownTimeout,
-	)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	shutdownErr := srv.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
-		logger.Printf(
-			"[WARN] graceful shutdown failed: %v; forcing close",
-			shutdownErr,
-		)
+		logger.Printf("[WARN] graceful shutdown failed: %v; forcing close", shutdownErr)
 		if err := srv.Close(); err != nil {
 			logger.Printf("[WARN] forcing HTTP server close: %v", err)
 		}
 	}
 
-	// فقط وقتی نتیجه را در select نگرفته‌ایم، کانال را دوباره می‌خوانیم.
 	if !serveResultReceived {
-		if err := <-serveErrCh; err != nil &&
-			!errors.Is(err, http.ErrServerClosed) &&
-			serveErr == nil {
+		if err := <-serveErrCh; err != nil && !errors.Is(err, http.ErrServerClosed) && serveErr == nil {
 			serveErr = fmt.Errorf("HTTP server: %w", err)
 		}
 	}
 
 	if shutdownErr != nil {
-		return errors.Join(
-			serveErr,
-			fmt.Errorf("HTTP shutdown: %w", shutdownErr),
-		)
+		return errors.Join(serveErr, fmt.Errorf("HTTP shutdown: %w", shutdownErr))
 	}
 	if serveErr != nil {
 		return serveErr
@@ -239,10 +208,7 @@ func loadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("RATE_LIMIT_RPS must be finite and > 0")
 	}
 
-	shutdownTimeout, err := envDuration(
-		"SHUTDOWN_TIMEOUT",
-		5*time.Second,
-	)
+	shutdownTimeout, err := envDuration("SHUTDOWN_TIMEOUT", 5*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -259,23 +225,16 @@ func loadConfig() (Config, error) {
 	}, nil
 }
 
-func pingRedis(
-	ctx context.Context,
-	rdb *redis.Client,
-	timeout time.Duration,
-) error {
+func pingRedis(ctx context.Context, rdb *redis.Client, timeout time.Duration) error {
 	pingCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
 	return rdb.Ping(pingCtx).Err()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		// پس از WriteHeader دیگر نمی‌توان status پاسخ را عوض کرد.
 		log.Printf("[WARN] writing JSON response: %v", err)
 	}
 }
@@ -287,8 +246,6 @@ type statusResponseWriter struct {
 }
 
 func (w *statusResponseWriter) WriteHeader(code int) {
-	// پاسخ‌های اطلاع‌رسانی مانند 100 و 103، وضعیت نهایی نیستند.
-	// 101 را برای سناریوی ارتقای پروتکل نگه می‌داریم.
 	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
 		w.ResponseWriter.WriteHeader(code)
 		return
@@ -310,42 +267,13 @@ func (w *statusResponseWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
-// Unwrap به http.ResponseController اجازه می‌دهد قابلیت‌های writer اصلی
-// مانند Flush و Hijack را پیدا کند.
+// Unwrap اتصال مستقیم ResponseController به ResponseWriter زیرین را فراهم می‌کند.
+// پیاده‌سازی متدهای Flush و Hijack به صورت دستی حذف شد تا Unwrap بدون شکست عمل کند.
 func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-func (w *statusResponseWriter) FlushError() error {
-	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
-	}
-	return http.NewResponseController(w.ResponseWriter).Flush()
-}
-
-func (w *statusResponseWriter) Flush() {
-	_ = w.FlushError()
-}
-
-func (w *statusResponseWriter) Hijack() (
-	net.Conn,
-	*bufio.ReadWriter,
-	error,
-) {
-	conn, rw, err := http.NewResponseController(
-		w.ResponseWriter,
-	).Hijack()
-	if err == nil && !w.wroteHeader {
-		w.statusCode = http.StatusSwitchingProtocols
-		w.wroteHeader = true
-	}
-	return conn, rw, err
-}
-
-func withBasicAccessLog(
-	logger *log.Logger,
-	next http.Handler,
-) http.Handler {
+func withBasicAccessLog(logger *log.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		wrapped := &statusResponseWriter{
@@ -379,7 +307,6 @@ func envInt(key string, def int) (int, error) {
 	if value == "" {
 		return def, nil
 	}
-
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
@@ -392,7 +319,6 @@ func envFloat(key string, def float64) (float64, error) {
 	if value == "" {
 		return def, nil
 	}
-
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be a float: %w", key, err)
@@ -405,7 +331,6 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 	if value == "" {
 		return def, nil
 	}
-
 	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be a duration: %w", key, err)
