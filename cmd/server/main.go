@@ -107,7 +107,7 @@ func run(logger *log.Logger) error {
 			return
 		}
 
-		if err := pingRedis(context.Background(), rdb, 800*time.Millisecond); err != nil {
+		if err := pingRedis(r.Context(), rdb, 800*time.Millisecond); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"status": "not_ready",
 				"redis":  "unavailable",
@@ -132,8 +132,9 @@ func run(logger *log.Logger) error {
 		`{"status":"error","message":"request_timeout"}`,
 	)
 
+	// ثبت مسیر بر اساس متد با متدولوژی Go 1.22+
 	mux.Handle(
-		"/api/v1/resource",
+		"GET /api/v1/resource",
 		withBasicAccessLog(logger, protectedAPI),
 	)
 
@@ -141,6 +142,8 @@ func run(logger *log.Logger) error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second, // پوشش تایم‌اوت‌های شبکه در سطح سرور
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -260,14 +263,15 @@ func pingRedis(
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	data, err := json.Marshal(v)
 	if err != nil {
 		log.Printf("[ERROR] marshaling JSON response: %v", err)
-		http.Error(w, `{"status":"error","message":"internal_server_error"}`, http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"status":"error","message":"internal_server_error"}`))
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if _, err := w.Write(data); err != nil {
 		log.Printf("[WARN] writing JSON response: %v", err)
@@ -307,6 +311,13 @@ func (w *statusResponseWriter) Write(p []byte) (int, error) {
 
 func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+// Flush پیاده‌سازی اینترفیس http.Flusher جهت سازگاری کامل
+func (w *statusResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func withBasicAccessLog(
