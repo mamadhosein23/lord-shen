@@ -1,393 +1,102 @@
-package main
+package tokenbucket
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"math"
-	"net"
-	"net/http"
-	"os"
-	"os/signal"
-	"strconv"
-	"sync/atomic"
-	"syscall"
 	"time"
 
-	"github.com/mamadhosein23/lord-shen/internal/limiter"
-	"github.com/mamadhosein23/lord-shen/internal/middleware"
 	"github.com/redis/go-redis/v9"
 )
 
-type Config struct {
-	HTTPAddr        string
-	RedisAddr       string
-	Capacity        int
-	RatePerSecond   float64
-	ShutdownTimeout time.Duration
+type Decision struct {
+	Allowed    bool
+	Remaining  int64
+	RetryAfter time.Duration
 }
 
-func main() {
-	logger := log.New(
-		os.Stdout,
-		"",
-		log.LstdFlags|log.LUTC|log.Lmicroseconds,
-	)
+type Redis struct {
+	client redis.UniversalClient
+	prefix string
+	script *redis.Script
+}
 
-	if err := run(logger); err != nil {
-		logger.Printf("[ERROR] Lord-Shen stopped: %v", err)
-		os.Exit(1)
+const script = `
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[3])
+
+-- زمان را از خود Redis می‌گیریم تا ساعت سرورهای برنامه
+-- در تصمیم‌گیری distributed اختلاف ایجاد نکند.
+local clock = redis.call("TIME")
+local now = tonumber(clock[1]) * 1000
+          + math.floor(tonumber(clock[2]) / 1000)
+
+local previous = redis.call(
+    "HMGET", KEYS[1], "tokens", "timestamp"
+)
+
+local tokens = tonumber(previous[1]) or capacity
+local last = tonumber(previous[2]) or now
+
+-- اگر ساعت Redis به عقب برگشت، توکن اضافه تولید نکن.
+local effective_now = math.max(now, last)
+local elapsed = effective_now - last
+
+tokens = math.min(
+    capacity,
+    tokens + elapsed * rate / 1000
+)
+
+local allowed = 0
+
+if tokens >= 1 then
+    allowed = 1
+    tokens = tokens - 1
+end
+
+redis.call(
+    "HSET",
+    KEYS[1],
+    "tokens", tostring(tokens),
+    "timestamp", effective_now
+)
+redis.call("PEXPIRE", KEYS[1], ttl_ms)
+
+local retry_ms = 0
+
+if allowed == 0 then
+    retry_ms = math.ceil((1 - tokens) * 1000 / rate)
+end
+
+return {
+    allowed,
+    math.floor(tokens),
+    retry_ms
+}
+`
+
+func New(client redis.UniversalClient, prefix string) *Redis {
+	return &Redis{
+		client: client,
+		prefix: prefix,
+		script: redis.NewScript(script),
 	}
 }
 
-func run(logger *log.Logger) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return fmt.Errorf("config: %w", err)
-	}
-
-	signalCtx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-	defer stop()
-
-	rdb := redis.NewClient(&redis.Options{
-		Addr:            cfg.RedisAddr,
-		PoolSize:        50,
-		MinIdleConns:    10,
-		DialTimeout:     2 * time.Second,
-		ReadTimeout:     1 * time.Second,
-		WriteTimeout:    1 * time.Second,
-		MaxRetries:      2,
-		PoolTimeout:     2 * time.Second,
-		ConnMaxIdleTime: 5 * time.Minute,
-		ConnMaxLifetime: 30 * time.Minute,
-	})
-	defer func() {
-		if err := rdb.Close(); err != nil {
-			logger.Printf("[WARN] closing Redis: %v", err)
-		}
-	}()
-
-	if err := pingRedis(signalCtx, rdb, 2*time.Second); err != nil {
-		logger.Printf(
-			"[WARN] Redis ping failed at startup: %v; /readyz will fail until Redis is available",
-			err,
-		)
-	}
-
-	if signalCtx.Err() != nil {
-		logger.Println("shutdown signal received during startup")
-		return nil
-	}
-
-	redisLimiter := limiter.NewRedisLimiter(rdb)
-	limiterMw := middleware.RateLimit(
-		redisLimiter,
-		middleware.RateLimitConfig{
-			Capacity:      cfg.Capacity,
-			RatePerSecond: cfg.RatePerSecond,
-		},
-	)
-
-	var draining atomic.Bool
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if draining.Load() {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
-			return
-		}
-
-		if err := pingRedis(r.Context(), rdb, 800*time.Millisecond); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"status": "not_ready",
-				"redis":  "unavailable",
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-	})
-
-	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":  "success",
-			"message": "Request permitted by Lord Shen",
-		})
-	})
-
-	// لایه محافظت از نشت گوروتین روی Handler پردازشی
-	protectedAPI := http.TimeoutHandler(
-		limiterMw(apiHandler),
-		5*time.Second,
-		`{"status":"error","message":"request_timeout"}`,
-	)
-
-	// ثبت مسیر بر اساس متد با متدولوژی Go 1.22+
-	mux.Handle(
-		"GET /api/v1/resource",
-		withBasicAccessLog(logger, protectedAPI),
-	)
-
-	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 3 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second, // پوشش تایم‌اوت‌های شبکه در سطح سرور
-		IdleTimeout:       120 * time.Second,
-	}
-
-	listener, err := net.Listen("tcp", cfg.HTTPAddr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
-	}
-
-	serveErrCh := make(chan error, 1)
-	go func() {
-		logger.Printf("Lord-Shen starting on %s", listener.Addr())
-		serveErrCh <- srv.Serve(listener)
-	}()
-
-	var serveErr error
-	var serveResultReceived bool
-
-	select {
-	case <-signalCtx.Done():
-		logger.Println("shutdown signal received")
-	case err := <-serveErrCh:
-		serveResultReceived = true
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr = fmt.Errorf("HTTP server: %w", err)
-			logger.Printf("[ERROR] %v", serveErr)
-		}
-	}
-
-	draining.Store(true)
-	srv.SetKeepAlivesEnabled(false)
-
-	shutdownCtx, cancel := context.WithTimeout(
-		context.Background(),
-		cfg.ShutdownTimeout,
-	)
-	defer cancel()
-
-	shutdownErr := srv.Shutdown(shutdownCtx)
-	if shutdownErr != nil {
-		logger.Printf(
-			"[WARN] graceful shutdown failed: %v; forcing close",
-			shutdownErr,
-		)
-		if err := srv.Close(); err != nil {
-			logger.Printf("[WARN] forcing HTTP server close: %v", err)
-		}
-	}
-
-	if !serveResultReceived {
-		if err := <-serveErrCh; err != nil &&
-			!errors.Is(err, http.ErrServerClosed) &&
-			serveErr == nil {
-			serveErr = fmt.Errorf("HTTP server: %w", err)
-		}
-	}
-
-	if shutdownErr != nil {
-		return errors.Join(
-			serveErr,
-			fmt.Errorf("HTTP shutdown: %w", shutdownErr),
-		)
-	}
-	if serveErr != nil {
-		return serveErr
-	}
-
-	logger.Println("Lord-Shen exited cleanly")
-	return nil
-}
-
-func loadConfig() (Config, error) {
-	capacity, err := envInt("RATE_LIMIT_CAPACITY", 20)
-	if err != nil {
-		return Config{}, err
-	}
-	if capacity <= 0 {
-		return Config{}, fmt.Errorf("RATE_LIMIT_CAPACITY must be > 0")
-	}
-
-	rps, err := envFloat("RATE_LIMIT_RPS", 5.0)
-	if err != nil {
-		return Config{}, err
-	}
-	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
-		return Config{}, fmt.Errorf("RATE_LIMIT_RPS must be finite and > 0")
-	}
-
-	shutdownTimeout, err := envDuration(
-		"SHUTDOWN_TIMEOUT",
-		5*time.Second,
-	)
-	if err != nil {
-		return Config{}, err
-	}
-	if shutdownTimeout <= 0 {
-		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be > 0")
-	}
-
-	return Config{
-		HTTPAddr:        envString("HTTP_ADDR", ":8080"),
-		RedisAddr:       envString("REDIS_ADDR", "localhost:6379"),
-		Capacity:        capacity,
-		RatePerSecond:   rps,
-		ShutdownTimeout: shutdownTimeout,
-	}, nil
-}
-
-func pingRedis(
+func (l *Redis) Allow(
 	ctx context.Context,
-	rdb *redis.Client,
-	timeout time.Duration,
-) error {
-	pingCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	return rdb.Ping(pingCtx).Err()
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	data, err := json.Marshal(v)
-	if err != nil {
-		log.Printf("[ERROR] marshaling JSON response: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"status":"error","message":"internal_server_error"}`))
-		return
+	identity string,
+	capacity int64,
+	ratePerSecond float64,
+) (Decision, error) {
+	if identity == "" {
+		return Decision{}, errors.New("empty rate-limit identity")
 	}
 
-	w.WriteHeader(status)
-	if _, err := w.Write(data); err != nil {
-		log.Printf("[WARN] writing JSON response: %v", err)
-	}
-}
-
-type statusResponseWriter struct {
-	http.ResponseWriter
-	statusCode   int
-	bytesWritten int64
-	wroteHeader  bool
-}
-
-func (w *statusResponseWriter) WriteHeader(code int) {
-	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
-		w.ResponseWriter.WriteHeader(code)
-		return
-	}
-
-	if w.wroteHeader {
-		return
-	}
-
-	w.statusCode = code
-	w.wroteHeader = true
-	w.ResponseWriter.WriteHeader(code)
-}
-
-func (w *statusResponseWriter) Write(p []byte) (int, error) {
-	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
-	}
-	n, err := w.ResponseWriter.Write(p)
-	w.bytesWritten += int64(n)
-	return n, err
-}
-
-func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-// Flush پیاده‌سازی اینترفیس http.Flusher جهت سازگاری کامل
-func (w *statusResponseWriter) Flush() {
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
-func withBasicAccessLog(
-	logger *log.Logger,
-	next http.Handler,
-) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		wrapped := &statusResponseWriter{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
-
-		next.ServeHTTP(wrapped, r)
-
-		logger.Printf(
-			"status=%d bytes=%d method=%s path=%s remote=%s ua=%q dur=%s",
-			wrapped.statusCode,
-			wrapped.bytesWritten,
-			r.Method,
-			r.URL.Path,
-			r.RemoteAddr,
-			r.UserAgent(),
-			time.Since(start),
-		)
-	})
-}
-
-func envString(key, def string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return def
-}
-
-func envInt(key string, def int) (int, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		return def, nil
-	}
-
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
-	}
-	return parsed, nil
-}
-
-func envFloat(key string, def float64) (float64, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		return def, nil
-	}
-
-	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a float: %w", key, err)
-	}
-	return parsed, nil
-}
-
-func envDuration(key string, def time.Duration) (time.Duration, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		return def, nil
-	}
-
-	parsed, err := time.ParseDuration(value)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a duration: %w", key, err)
-	}
-	return parsed, nil
-}
+	if capacity <= 0 || capacity > 1_000_000 {
+		return Decision{}, errors.New(
+			"capacity must be between 
