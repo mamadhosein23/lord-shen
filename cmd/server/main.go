@@ -129,6 +129,7 @@ func (l *Redis) Allow(
 	digest := sha256.Sum256([]byte(identity))
 	key := l.prefix + hex.EncodeToString(digest[:])
 
+	
 	result, err := l.script.Run(
 		ctx,
 		l.client,
