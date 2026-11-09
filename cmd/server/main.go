@@ -8,13 +8,6 @@ import (
 	"fmt"
 	"math"
 
--- زمان را از خود Redis 
-local last = tonumber(previous[2]) or now
-
--- اگر ساعت Redis به عقب برگشت، توکن اضافه تولید نکن.
-local effective_now = math.max(now, last)
-local elapsed = effective_now - last
-
 tokens = math.min(
     capacity,
     tokens + elapsed * rate / 1000
