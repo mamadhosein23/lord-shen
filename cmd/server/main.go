@@ -4,17 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"fmt"
-	"math"
-
-tokens = math.min(
-    capacity,
-    tokens + elapsed * rate / 1000
-)
-
-local allowed = 0
-
 if tokens >= 1 then
     allowed = 1
     tokens = tokens - 1
