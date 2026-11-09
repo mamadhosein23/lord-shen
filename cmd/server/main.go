@@ -8,17 +8,6 @@ import (
 	"fmt"
 	"math"
 
-type Redis struct {
-	client redis.UniversalClient
-	prefix string
-	script *redis.Script
-}
-
-const script = `
-local capacity = tonumber(ARGV[1])
-local rate = tonumber(ARGV[2])
-local ttl_ms = tonumber(ARGV[3])
-
 -- زمان را از خود Redis می‌گیریم تا ساعت سرورهای برنامه
 -- در تصمیم‌گیری distributed اختلاف ایجاد نکند.
 local clock = redis.call("TIME")
