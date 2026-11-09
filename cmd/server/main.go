@@ -6,21 +6,6 @@ import (
 	"encoding/hex"
 if tokens >= 1 then
     allowed = 1
-    tokens = tokens - 1
-end
-
-redis.call(
-    "HSET",
-    KEYS[1],
-    "tokens", tostring(tokens),
-    "timestamp", effective_now
-)
-redis.call("PEXPIRE", KEYS[1], ttl_ms)
-
-local retry_ms = 0
-
-if allowed == 0 then
-    retry_ms = math.ceil((1 - tokens) * 1000 / rate)
 end
 
 return {
