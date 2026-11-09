@@ -8,17 +8,7 @@ import (
 	"fmt"
 	"math"
 
--- زمان را از خود Redis می‌گیریم تا ساعت سرورهای برنامه
--- در تصمیم‌گیری distributed اختلاف ایجاد نکند.
-local clock = redis.call("TIME")
-local now = tonumber(clock[1]) * 1000
-          + math.floor(tonumber(clock[2]) / 1000)
-
-local previous = redis.call(
-    "HMGET", KEYS[1], "tokens", "timestamp"
-)
-
-local tokens = tonumber(previous[1]) or capacity
+-- زمان را از خود Redis 
 local last = tonumber(previous[2]) or now
 
 -- اگر ساعت Redis به عقب برگشت، توکن اضافه تولید نکن.
