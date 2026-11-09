@@ -7,16 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"time"
-
-	"github.com/redis/go-redis/v9"
-)
-
-type Decision struct {
-	Allowed    bool
-	Remaining  int64
-	RetryAfter time.Duration
-}
 
 type Redis struct {
 	client redis.UniversalClient
