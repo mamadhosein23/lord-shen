@@ -29,8 +29,7 @@ local capacity = tonumber(ARGV[1])
 local rate = tonumber(ARGV[2])
 local ttl_ms = tonumber(ARGV[3])
 
--- زمان را از خود Redis می‌گیریم تا ساعت سرورهای برنامه
--- در تصمیم‌گیری distributed اختلاف ایجاد نکند.
+-- Query time directly from Redis to eliminate clock skew across distributed app servers.
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000
           + math.floor(tonumber(clock[2]) / 1000)
@@ -42,7 +41,7 @@ local previous = redis.call(
 local tokens = tonumber(previous[1]) or capacity
 local last = tonumber(previous[2]) or now
 
--- اگر ساعت Redis به عقب برگشت، توکن اضافه تولید نکن.
+-- Prevent generating excess tokens if the Redis clock steps backward.
 local effective_now = math.max(now, last)
 local elapsed = effective_now - last
 
@@ -112,8 +111,7 @@ func (l *Redis) Allow(
 		)
 	}
 
-	// TTL را محدود می‌کنیم تا کلیدهای خیلی کم‌مصرف
-	// برای مدت غیرمنتظره در Redis باقی نمانند.
+	// Cap bucket TTL to avoid retaining keys indefinitely for inactive identities.
 	const maxLifetimeSeconds = 7 * 24 * 60 * 60
 
 	lifetimeSeconds := float64(capacity) / ratePerSecond
@@ -127,7 +125,7 @@ func (l *Redis) Allow(
 		math.Ceil(lifetimeSeconds*1000),
 	) + 1000
 
-	// IP خام را به‌عنوان کلید Redis ذخیره نمی‌کنیم.
+	// Hash the raw IP address to avoid storing unmasked client IPs directly in Redis keys.
 	digest := sha256.Sum256([]byte(identity))
 	key := l.prefix + hex.EncodeToString(digest[:])
 
@@ -156,4 +154,3 @@ func (l *Redis) Allow(
 		RetryAfter: time.Duration(result[2]) * time.Millisecond,
 	}, nil
 }
-
