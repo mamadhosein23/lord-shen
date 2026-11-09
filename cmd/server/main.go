@@ -7,23 +7,6 @@ import (
 if tokens >= 1 then
     allowed = 1
 end
-
-return {
-    allowed,
-    math.floor(tokens),
-    retry_ms
-}
-`
-
-func New(client redis.UniversalClient, prefix string) *Redis {
-	return &Redis{
-		client: client,
-		prefix: prefix,
-		script: redis.NewScript(script),
-	}
-}
-
-func (l *Redis) Allow(
 	ctx context.Context,
 	identity string,
 	capacity int64,
