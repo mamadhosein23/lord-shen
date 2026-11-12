@@ -1,3 +1,70 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Config holds the application configuration parameters for HTTP and Limiter engines.
+type Config struct {
+	Addr            string        // Server listener address (e.g., ":8080", "127.0.0.1:8080")
+	RedisAddr       string        // Redis host:port
+	Rate            float64       // Token generation rate per second
+	Burst           int           // Maximum bucket capacity
+	KeyTTL          time.Duration // Time-to-live duration before idle limiter keys expire
+	ShutdownTimeout time.Duration // Graceful shutdown context timeout
+}
+
+// Load reads and validates configuration parameters from environment variables.
+func Load() (*Config, error) {
+	var errs []error
+
+	rate, err := getEnvFloat("RATE", 5.0)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("RATE: %w", err))
+	}
+
+	burst, err := getEnvInt("BURST", 20)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("BURST: %w", err))
+	}
+
+	keyTTL, err := getEnvDuration("KEY_TTL", 10*time.Minute)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("KEY_TTL: %w", err))
+	}
+
+	shutdownTimeout, err := getEnvDuration("SHUTDOWN_TIMEOUT", 5*time.Second)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+
+	cfg := &Config{
+		Addr:            getEnv("ADDR", ":8080"),
+		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
+		Rate:            rate,
+		Burst:           burst,
+		KeyTTL:          keyTTL,
+		ShutdownTimeout: shutdownTimeout,
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
+
+	return cfg, nil
+}
+
 // validate ensures all configuration parameters fall within safe production limits.
 func (c *Config) validate() error {
 	var errs []error
@@ -18,7 +85,7 @@ func (c *Config) validate() error {
 	}
 
 	// 4. Token bucket consistency check: TTL must be >= full refill time
-	// Only meaningful when rate and burst are valid (checked above)
+	// Skipped when an earlier check failed, since the refill math needs a valid rate and burst
 	if len(errs) == 0 {
 		refillSec := float64(c.Burst) / c.Rate
 		if refillSec > float64(math.MaxInt64/int64(time.Second)) {
@@ -66,4 +133,61 @@ func validateAddr(addr string, allowPortOnly bool) error {
 		return fmt.Errorf("invalid port %q: must be between 1 and 65535", port)
 	}
 	return nil
+}
+
+// Helper functions for reading environment variables cleanly
+
+func lookupEnvTrim(key string) (string, bool) {
+	val, ok := os.LookupEnv(key)
+	if !ok {
+		return "", false
+	}
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return "", false
+	}
+	return val, true
+}
+
+func getEnv(key, def string) string {
+	if val, ok := lookupEnvTrim(key); ok {
+		return val
+	}
+	return def
+}
+
+func getEnvInt(key string, def int) (int, error) {
+	val, ok := lookupEnvTrim(key)
+	if !ok {
+		return def, nil
+	}
+	res, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, fmt.Errorf("invalid int: %w", err)
+	}
+	return res, nil
+}
+
+func getEnvFloat(key string, def float64) (float64, error) {
+	val, ok := lookupEnvTrim(key)
+	if !ok {
+		return def, nil
+	}
+	res, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid float: %w", err)
+	}
+	return res, nil
+}
+
+func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
+	val, ok := lookupEnvTrim(key)
+	if !ok {
+		return def, nil
+	}
+	res, err := time.ParseDuration(val)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration: %w", err)
+	}
+	return res, nil
 }
