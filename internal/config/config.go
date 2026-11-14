@@ -11,44 +11,38 @@ import (
 	"time"
 )
 
-// Config holds the application configuration parameters for HTTP and Limiter engines.
 type Config struct {
-	Addr            string        // Server listener address (e.g., ":8080", "127.0.0.1:8080")
-	RedisAddr       string        // Redis host:port
-	Rate            float64       // Token generation rate per second
-	Burst           int           // Maximum bucket capacity
-	KeyTTL          time.Duration // Time-to-live duration before idle limiter keys expire
-	ShutdownTimeout time.Duration // Graceful shutdown context timeout
+	Addr            string
+	RedisAddr       string
+	Rate            float64
+	Burst           int
+	KeyTTL          time.Duration
+	ShutdownTimeout time.Duration
 }
 
-// Load reads and validates configuration parameters from environment variables.
 func Load() (*Config, error) {
 	var errs []error
 
+	// Parse layer: هر مقدار یا معتبر است یا خطا جمع می‌شود.
+	// در صورت خطا مقدار پیش‌فرض برگردانده می‌شود تا مقدار صفر بی‌سروصدا وارد نشود.
 	rate, err := getEnvFloat("RATE", 5.0)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("RATE: %w", err))
 	}
-
 	burst, err := getEnvInt("BURST", 20)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("BURST: %w", err))
 	}
-
 	keyTTL, err := getEnvDuration("KEY_TTL", 10*time.Minute)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("KEY_TTL: %w", err))
 	}
-
 	shutdownTimeout, err := getEnvDuration("SHUTDOWN_TIMEOUT", 5*time.Second)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err))
 	}
 
-	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
-	}
-
+	// Addr و RedisAddr همیشه ساخته و معتبرسازی می‌شوند (نه فقط وقتی چیزی خطا نداده)
 	cfg := &Config{
 		Addr:            getEnv("ADDR", ":8080"),
 		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
@@ -58,56 +52,58 @@ func Load() (*Config, error) {
 		ShutdownTimeout: shutdownTimeout,
 	}
 
-	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
-	}
-
-	return cfg, nil
-}
-
-// validate ensures all configuration parameters fall within safe production limits.
-func (c *Config) validate() error {
-	var errs []error
-
-	// 1. Validate Rate (prevent <= 0, NaN, and Inf)
-	if c.Rate <= 0 || math.IsNaN(c.Rate) || math.IsInf(c.Rate, 0) {
-		errs = append(errs, fmt.Errorf("rate must be a positive finite number, got %f", c.Rate))
-	}
-
-	// 2. Validate Burst
-	if c.Burst <= 0 {
-		errs = append(errs, fmt.Errorf("burst must be > 0, got %d", c.Burst))
-	}
-
-	// 3. KeyTTL must be positive on its own, not only through the refill check
-	if c.KeyTTL <= 0 {
-		errs = append(errs, fmt.Errorf("key_ttl must be positive, got %v", c.KeyTTL))
-	}
-
-	// 4. Token bucket consistency check: TTL must be >= full refill time
-	// Skipped when an earlier check failed, since the refill math needs a valid rate and burst
-	if len(errs) == 0 {
-		refillSec := float64(c.Burst) / c.Rate
-		if refillSec > float64(math.MaxInt64/int64(time.Second)) {
-			errs = append(errs, errors.New("burst/rate ratio creates duration overflow"))
+	if verr := cfg.validate(); verr != nil {
+		var joined interface{ Unwrap() []error }
+		if errors.As(verr, &joined) {
+			errs = append(errs, joined.Unwrap()...)
 		} else {
-			minRefillDuration := time.Duration(refillSec * float64(time.Second))
-			if c.KeyTTL < minRefillDuration {
-				errs = append(errs, fmt.Errorf("key_ttl (%v) must be >= bucket refill time (%v)", c.KeyTTL, minRefillDuration))
-			}
+			errs = append(errs, verr)
 		}
 	}
 
-	// 5. Validate Timeouts
+	if len(errs) > 0 {
+		return nil, joinErrs(errs)
+	}
+	return cfg, nil
+}
+
+// joinErrs پیام‌ها را در یک خط جمع می‌کند تا لاگ‌های تک‌خطی سالم بمانند.
+func joinErrs(errs []error) error {
+	msgs := make([]string, 0, len(errs))
+	for _, e := range errs {
+		if e != nil {
+			msgs = append(msgs, e.Error())
+		}
+	}
+	return fmt.Errorf("config: %s", strings.Join(msgs, "; "))
+}
+
+func (c *Config) validate() error {
+	var errs []error
+
+	if err := validateRate(c.Rate); err != nil {
+		errs = append(errs, err)
+	}
+	if c.Burst <= 0 {
+		errs = append(errs, fmt.Errorf("burst must be > 0, got %d", c.Burst))
+	}
+	if c.KeyTTL <= 0 {
+		errs = append(errs, fmt.Errorf("key_ttl must be positive, got %v", c.KeyTTL))
+	}
 	if c.ShutdownTimeout <= 0 {
 		errs = append(errs, errors.New("shutdown_timeout must be positive"))
 	}
 
-	// 6. Validate Network Addresses
+	// فقط وقتی rate و burst معتبرند، ریاضیِ refill معنا دارد
+	if len(errs) == 0 {
+		if err := validateRefill(c.Rate, c.Burst, c.KeyTTL); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if err := validateAddr(c.Addr, true); err != nil {
 		errs = append(errs, fmt.Errorf("invalid listener addr %q: %w", c.Addr, err))
 	}
-
 	if err := validateAddr(c.RedisAddr, false); err != nil {
 		errs = append(errs, fmt.Errorf("invalid redis addr %q: %w", c.RedisAddr, err))
 	}
@@ -115,27 +111,65 @@ func (c *Config) validate() error {
 	return errors.Join(errs...)
 }
 
-// validateAddr verifies host:port or :port specifications correctly.
+func validateRate(rate float64) error {
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 {
+		return fmt.Errorf("rate must be a positive finite number, got %v", rate)
+	}
+	return nil
+}
+
+func validateRefill(rate float64, burst int, ttl time.Duration) error {
+	refillSec := float64(burst) / rate     // ممکن است Inf شود (rate بسیار کوچک)
+	if math.IsInf(refillSec, 0) {
+		return errors.New("rate too small: burst/rate ratio overflows")
+	}
+	const maxSec = float64(math.MaxInt64) / float64(time.Second) // ≈ 9.22e9
+	if refillSec > maxSec {
+		return fmt.Errorf("burst/rate ratio (%g s) creates duration overflow", refillSec)
+	}
+	minRefill := time.Duration(refillSec * float64(time.Second))
+	if ttl < minRefill {
+		return fmt.Errorf("key_ttl (%v) must be >= bucket refill time (%v)", ttl, minRefill)
+	}
+	return nil
+}
+
 func validateAddr(addr string, allowPortOnly bool) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return errors.New("address must not be empty")
+	}
+
+	// در حالت allowPortOnly، اگر ":" ندارد اما عدد است، ":عدد" بساز.
+	// "8080" بدون ":" فقط برای listener مجاز است، اما Go با چنین آدرسی Listen نمی‌کند؛
+	// پس تبدیل صریح انجام می‌دهیم تا رفتار runtime با validate یکی باشد.
 	target := addr
 	if allowPortOnly && !strings.Contains(target, ":") {
 		target = ":" + target
 	}
-	_, port, err := net.SplitHostPort(target)
+
+	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return err
 	}
 	if port == "" {
 		return errors.New("missing port in address")
 	}
-	p, err := strconv.Atoi(port)
-	if err != nil || p < 1 || p > 65535 {
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("invalid port %q: must be between 1 and 65535", port)
+	}
+	// no address passes SplitHostPort with a whitespace in host
+	if strings.ContainsAny(host, " \t\n") {
+		return fmt.Errorf("invalid host %q", host)
+	}
+	// IPv6 literal بدون براکت
+	if strings.Count(host, ":") > 1 && !strings.HasPrefix(target, "[") {
+		return fmt.Errorf("IPv6 host must be bracketed, got %q", host)
 	}
 	return nil
 }
 
-// Helper functions for reading environment variables cleanly
+// ---------- env helpers ----------
 
 func lookupEnvTrim(key string) (string, bool) {
 	val, ok := os.LookupEnv(key)
@@ -161,11 +195,11 @@ func getEnvInt(key string, def int) (int, error) {
 	if !ok {
 		return def, nil
 	}
-	res, err := strconv.Atoi(val)
+	n, err := strconv.Atoi(val)
 	if err != nil {
-		return 0, fmt.Errorf("invalid int: %w", err)
+		return def, fmt.Errorf("invalid int %q: %w", val, err)
 	}
-	return res, nil
+	return n, nil
 }
 
 func getEnvFloat(key string, def float64) (float64, error) {
@@ -173,11 +207,11 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	if !ok {
 		return def, nil
 	}
-	res, err := strconv.ParseFloat(val, 64)
+	f, err := strconv.ParseFloat(val, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid float: %w", err)
+		return def, fmt.Errorf("invalid float %q: %w", val, err)
 	}
-	return res, nil
+	return f, nil
 }
 
 func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
@@ -185,9 +219,9 @@ func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
 	if !ok {
 		return def, nil
 	}
-	res, err := time.ParseDuration(val)
+	d, err := time.ParseDuration(val)
 	if err != nil {
-		return 0, fmt.Errorf("invalid duration: %w", err)
+		return def, fmt.Errorf("invalid duration %q: %w", val, err)
 	}
-	return res, nil
+	return d, nil
 }
