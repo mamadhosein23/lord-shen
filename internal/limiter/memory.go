@@ -10,7 +10,6 @@ import (
 )
 
 var errClosed = errors.New("token bucket is closed")
-
 // TokenBucket is a concurrent-safe, in-memory token bucket rate limiter.
 type TokenBucket struct {
 	rate         float64
