@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Config - مقادیر نهایی و Immutable برای اپلیکیشن
+// Config - Final and Immutable application configuration
 type Config struct {
 	Addr            string
 	RedisAddr       string
@@ -27,14 +27,14 @@ type options struct {
 
 type Option func(*options)
 
-// WithPrefix اجازه می‌دهد متغیرها با پیشوند خاصی خوانده شوند (مثلاً "APP_")
+// WithPrefix allows environment variables to be read with a specific prefix (e.g., "APP_")
 func WithPrefix(prefix string) Option {
 	return func(o *options) {
 		o.prefix = prefix
 	}
 }
 
-// Load پیکربندی را از Env می‌خواند و اعتبارسنجی می‌کند
+// Load reads configuration from environment variables and validates it
 func Load(opts ...Option) (*Config, error) {
 	o := &options{prefix: ""}
 	for _, opt := range opts {
@@ -84,7 +84,7 @@ func Load(opts ...Option) (*Config, error) {
 	return cfg, nil
 }
 
-// validate اعتبارسنجی دامنه و مقادیر منطقی را انجام می‌دهد
+// validate performs domain and logic validation on configuration fields
 func (c *Config) validate() error {
 	var errs []error
 
@@ -119,7 +119,7 @@ func validateNetworkAddr(key, addr string) error {
 	if err != nil || p <= 0 || p > 65535 {
 		return fmt.Errorf("%s: invalid port %q (must be 1-65535)", key, port)
 	}
-	_ = host // میزبان می‌تواند خالی باشد (مانند ":8080")
+	_ = host // Host can be empty (e.g., ":8080")
 	return nil
 }
 
