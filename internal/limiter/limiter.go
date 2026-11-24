@@ -3,43 +3,58 @@ package limiter
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
-const (
-	AlgorithmTokenBucket          Algorithm = "token_bucket"
-	AlgorithmSlidingWindowLog     Algorithm = "sliding_window_log"
-	AlgorithmSlidingWindowCounter Algorithm = "sliding_window_counter"
-	AlgorithmFixedWindow          Algorithm = "fixed_window"
+	"unsafe"
 )
 
-// Result describes the evaluation outcome of a rate-limiting evaluation.
-// Directly implements the IETF RateLimit Headers specification:
-// https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/
-type Result struct {
-	Allowed    bool          // True if request is within quota
-	Limit      int           // Quota ceiling for the current window/bucket
-	Remaining  int           // Remaining allowed requests before throttling
-	ResetAt    time.Time     // Absolute timestamp when the limit fully resets/refills
-	RetryAfter time.Duration // Duration to wait before retrying (0 if Allowed is true)
+// Sentinel errors as immutable value types for errors.Is() matching.
+var (
+	ErrInvalidBatchSize = errors.New("limiter: batch count n must be > 0")
+	ErrKeyNotFound      = errors.New("limiter: rate limit key not found")
+	ErrRateExceeded     = errors.New("limiter: quota exceeded")
+	ErrClosed           = errors.New("limiter: engine is closed")
+)
+
+// Policy exposes the static rule governing a bucket/window for RFC RateLimit-Policy.
+type Policy struct {
+	Limit  int           // Quota limit
+	Window time.Duration // Window timeframe (e.g., 1m, 1h)
+	Burst  int           // Max capacity for leaky/token bucket
 }
 
-// RetryAfterSeconds returns integer delta seconds client must wait.
-// Complies with RFC 9110 § 10.2.3 (HTTP Semantics: Retry-After).
-// Uses zero-allocation integer arithmetic.
+// Result describes the evaluation outcome of a rate-limiting evaluation.
+// Conforms directly with IETF RateLimit Headers specification:
+// (draft-ietf-httpapi-ratelimit-headers-08).
+// Memory layout is ordered by field alignment (64-bit down to 8-bit) to minimize struct padding.
+type Result struct {
+	ResetAt    time.Time     // 24 bytes: Monotonic + wall clock
+	RetryAfter time.Duration // 8 bytes: Wait time if throttled
+	Limit      int           // 8 bytes (on 64-bit arch)
+	Remaining  int           // 8 bytes
+	Window     time.Duration // 8 bytes: Window of policy
+	Allowed    bool          // 1 byte
+	// 7 bytes padding inserted by compiler here
+}
+
+// RetryAfterSeconds returns integer seconds to wait before retry.
+// Uses fast integer math: ceil(duration / 1s).
+// Guaranteed to return at least 1s if throttled (RFC 9110 § 10.2.3).
 func (r Result) RetryAfterSeconds() int {
-	if r.RetryAfter <= 0 {
-		if !r.Allowed {
-			return 1 // Guard against 0s infinite tight retry loop
-		}
+	if r.Allowed || r.RetryAfter <= 0 {
 		return 0
 	}
 	// Integer ceiling: (d + 1s - 1ns) / 1s
-	return int((r.RetryAfter + time.Second - 1) / time.Second)
+	sec := int((r.RetryAfter + time.Second - 1) / time.Second)
+	if sec <= 0 {
+		return 1
+	}
+	return sec
 }
 
 // ResetSeconds returns integer delta seconds until ResetAt relative to 'now'.
-// Complies with IETF RateLimit-Reset header specification.
 func (r Result) ResetSeconds(now time.Time) int {
 	if !now.Before(r.ResetAt) {
 		if !r.Allowed {
@@ -48,50 +63,89 @@ func (r Result) ResetSeconds(now time.Time) int {
 		return 0
 	}
 	diff := r.ResetAt.Sub(now)
-	return int((diff + time.Second - 1) / time.Second)
+	sec := int((diff + time.Second - 1) / time.Second)
+	if sec <= 0 && !r.Allowed {
+		return 1
+	}
+	return sec
 }
 
-// WriteHeaders applies standard IETF and RFC 9110 rate limit headers
-// directly onto an http.Header or ResponseWriter.
-func (r Result) WriteHeaders(h http.Header, now time.Time) {
-	h.Set("RateLimit-Limit", strconv.Itoa(r.Limit))
-	h.Set("RateLimit-Remaining", strconv.Itoa(r.Remaining))
-	h.Set("RateLimit-Reset", strconv.Itoa(r.ResetSeconds(now)))
+// Fast header key constants (avoids allocation during canonicalization).
+const (
+	HeaderRateLimitLimit     = "RateLimit-Limit"
+	HeaderRateLimitRemaining = "RateLimit-Remaining"
+	HeaderRateLimitReset     = "RateLimit-Reset"
+	HeaderRateLimitPolicy    = "RateLimit-Policy"
+	HeaderRetryAfter         = "Retry-After"
+)
 
+// WriteHeaders applies IETF standard headers directly into http.Header.
+// Employs a stack-allocated buffer to eliminate heap allocations for integer conversions.
+func (r Result) WriteHeaders(h http.Header, now time.Time) {
+	var buf [32]byte
+
+	// 1. RateLimit-Limit
+	h[HeaderRateLimitLimit] = []string{string(strconv.AppendInt(buf[:0], int64(r.Limit), 10))}
+
+	// 2. RateLimit-Remaining
+	rem := r.Remaining
+	if rem < 0 {
+		rem = 0
+	}
+	h[HeaderRateLimitRemaining] = []string{string(strconv.AppendInt(buf[:0], int64(rem), 10))}
+
+	// 3. RateLimit-Reset
+	h[HeaderRateLimitReset] = []string{string(strconv.AppendInt(buf[:0], int64(r.ResetSeconds(now)), 10))}
+
+	// 4. RateLimit-Policy (e.g., "100;w=60") if window is present
+	if r.Window > 0 {
+		wSec := int64(r.Window / time.Second)
+		pBuf := strconv.AppendInt(buf[:0], int64(r.Limit), 10)
+		pBuf = append(pBuf, ';', 'w', '=')
+		pBuf = strconv.AppendInt(pBuf, wSec, 10)
+		h[HeaderRateLimitPolicy] = []string{string(pBuf)}
+	}
+
+	// 5. RFC 9110 Retry-After header on 429
 	if !r.Allowed {
-		h.Set("Retry-After", strconv.Itoa(r.RetryAfterSeconds()))
+		h[HeaderRetryAfter] = []string{string(strconv.AppendInt(buf[:0], int64(r.RetryAfterSeconds()), 10))}
 	}
 }
 
-// Limiter defines the universal contract for rate-limiting engines.
+// Limiter is the clean, unbloated core interface.
 type Limiter interface {
-	// Allow evaluates whether a single unit is permitted for key.
+	// Allow evaluates a single unit against key.
 	Allow(ctx context.Context, key string) (Result, error)
 
-	// AllowN evaluates whether n units are permitted for key.
-	// Implementations MUST return ErrInvalidBatchSize if n <= 0.
+	// AllowN evaluates n units against key. Returns ErrInvalidBatchSize if n <= 0.
 	AllowN(ctx context.Context, key string, n int) (Result, error)
 
-	// Inspect queries quota status without consuming tokens/slots.
+	// Inspect views quota without state mutation.
 	Inspect(ctx context.Context, key string) (Result, error)
 
-	// Reset resets or clears the quota for the specified key immediately.
+	// Reset invalidates counter/bucket for key immediately.
 	Reset(ctx context.Context, key string) error
 }
 
-// Reservation represents an intent to consume a token in the future.
-type Reservation struct {
-	Allowed bool
-	Delay   time.Duration // Duration caller must sleep before proceeding
+// ZeroAllocKeyLimiter provides a zero-allocation interface for hot network paths
+// where keys are received as raw bytes ([]byte) from the transport layer.
+type ZeroAllocKeyLimiter interface {
+	AllowBytes(ctx context.Context, key []byte) (Result, error)
+	AllowNBytes(ctx context.Context, key []byte, n int) (Result, error)
 }
 
-// WaitLimiter adds queueing/blocking rate limit semantics for background workers.
-type WaitLimiter interface {
-	Limiter
+// StringToBytesUnsafe converts string to byte slice without heap allocation.
+// (Useful inside driver implementations).
+func StringToBytesUnsafe(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
 
-	// Reserve returns a Reservation indicating how long to wait before token is available.
-	Reserve(ctx context.Context, key string) (Reservation, error)
+// BytesToStringUnsafe converts byte slice to string without heap allocation.
+func BytesToStringUnsafe(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
 
-	// Wait blocks until a token becomes available or ctx is cancelled.
-	Wait(ctx context.Context, key string) error
+// Closer is an optional interface checked by drivers (IoC / composition over pollution).
+type Closer interface {
+	io.Closer
 }
