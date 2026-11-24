@@ -6,18 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"time"
-)
-
-// Common sentinel errors.
-var (
-	ErrInvalidBatchSize = errors.New("limiter: batch count n must be greater than 0")
-	ErrKeyNotFound      = errors.New("limiter: key not found")
-	ErrClosed           = errors.New("limiter: engine is closed")
-)
-
-// Algorithm identifies the underlying rate-limiting strategy.
-type Algorithm string
-
 const (
 	AlgorithmTokenBucket          Algorithm = "token_bucket"
 	AlgorithmSlidingWindowLog     Algorithm = "sliding_window_log"
