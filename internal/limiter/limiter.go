@@ -1,9 +1,26 @@
 package limiter
 
-import 
+import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"strconv"
+	"time"
+	"unsafe"
+)
+
+// Sentinel errors as immutable value types for errors.Is() matching.
+var (
+	ErrInvalidBatchSize = errors.New("limiter: batch count n must be > 0")
+	ErrKeyNotFound      = errors.New("limiter: rate limit key not found")
+	ErrRateExceeded     = errors.New("limiter: quota exceeded")
+	ErrClosed           = errors.New("limiter: engine is closed")
+)
+
+// Policy exposes the static rule governing a bucket/window for RFC RateLimit-Policy.
+type Policy struct {
+	Limit  int           // Quota limit
 	Window time.Duration // Window timeframe (e.g., 1m, 1h)
 	Burst  int           // Max capacity for leaky/token bucket
 }
