@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Config - مقادیر نهایی و Immutable
+// Config - مقادیر نهایی و Immutable برای اپلیکیشن
 type Config struct {
 	Addr            string
 	RedisAddr       string
@@ -21,7 +21,6 @@ type Config struct {
 	ShutdownTimeout time.Duration
 }
 
-// options ساختار درونی برای مدیریت تنظیمات Load
 type options struct {
 	prefix string
 }
@@ -35,30 +34,35 @@ func WithPrefix(prefix string) Option {
 	}
 }
 
-// Load با الگوی Functional Options
+// Load پیکربندی را از Env می‌خواند و اعتبارسنجی می‌کند
 func Load(opts ...Option) (*Config, error) {
-	o := &options{prefix: ""} // پیش‌فرض بدون پیشوند
+	o := &options{prefix: ""}
 	for _, opt := range opts {
 		opt(o)
 	}
 
 	var errs []error
-	
-	// تعریف helper محلی برای اعمال پیشوند
 	read := func(key string) string { return o.prefix + key }
 
-	// خواندن با prefix
 	rate, err := getEnvFloat(read("RATE"), 5.0)
-	if err != nil { errs = append(errs, err) }
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	burst, err := getEnvInt(read("BURST"), 20)
-	if err != nil { errs = append(errs, err) }
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	keyTTL, err := getEnvDuration(read("KEY_TTL"), 10*time.Minute)
-	if err != nil { errs = append(errs, err) }
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	shutdown, err := getEnvDuration(read("SHUTDOWN_TIMEOUT"), 5*time.Second)
-	if err != nil { errs = append(errs, err) }
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	cfg := &Config{
 		Addr:            getEnv(read("ADDR"), ":8080"),
@@ -69,21 +73,27 @@ func Load(opts ...Option) (*Config, error) {
 		ShutdownTimeout: shutdown,
 	}
 
-	// ترکیب اعتبارسنجی با خطاهای خواندن
 	if verr := cfg.validate(); verr != nil {
 		errs = append(errs, verr)
 	}
 
 	if len(errs) > 0 {
-		return nil, flattenErrors(errs)
+		return nil, fmt.Errorf("config loading failed:\n%w", errors.Join(errs...))
 	}
+
 	return cfg, nil
 }
 
-// validate - اعتبارسنجی جداگانه (Domain Validation)
+// validate اعتبارسنجی دامنه و مقادیر منطقی را انجام می‌دهد
 func (c *Config) validate() error {
 	var errs []error
 
+	if err := validateNetworkAddr("ADDR", c.Addr); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateNetworkAddr("REDIS_ADDR", c.RedisAddr); err != nil {
+		errs = append(errs, err)
+	}
 	if math.IsNaN(c.Rate) || math.IsInf(c.Rate, 0) || c.Rate <= 0 {
 		errs = append(errs, fmt.Errorf("RATE must be positive, got %v", c.Rate))
 	}
@@ -93,23 +103,27 @@ func (c *Config) validate() error {
 	if c.KeyTTL <= 0 {
 		errs = append(errs, fmt.Errorf("KEY_TTL must be > 0, got %v", c.KeyTTL))
 	}
-    // ... ادامه اعتبارسنجی‌های قبلی با متد validateAddr
-    
+	if c.ShutdownTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT must be > 0, got %v", c.ShutdownTimeout))
+	}
+
 	return errors.Join(errs...)
 }
 
-// flattenErrors یک خطای تمیز و خوانا برمی‌گرداند
-func flattenErrors(errs []error) error {
-	var b strings.Builder
-	b.WriteString("config loading failed: ")
-	for i, err := range errs {
-		if i > 0 { b.WriteString("; ") }
-		b.WriteString(err.Error())
+func validateNetworkAddr(key, addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s: invalid format (must be host:port or :port): %w", key, err)
 	}
-	return errors.New(b.String())
+	p, err := strconv.Atoi(port)
+	if err != nil || p <= 0 || p > 65535 {
+		return fmt.Errorf("%s: invalid port %q (must be 1-65535)", key, port)
+	}
+	_ = host // میزبان می‌تواند خالی باشد (مانند ":8080")
+	return nil
 }
 
-// --- Env Helpers --- 
+// --- Env Helpers ---
 
 func getEnv(key, def string) string {
 	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
@@ -120,10 +134,36 @@ func getEnv(key, def string) string {
 
 func getEnvInt(key string, def int) (int, error) {
 	val, ok := os.LookupEnv(key)
-	if !ok || strings.TrimSpace(val) == "" { return def, nil }
+	if !ok || strings.TrimSpace(val) == "" {
+		return def, nil
+	}
 	n, err := strconv.Atoi(strings.TrimSpace(val))
-	if err != nil { return 0, fmt.Errorf("%s: invalid integer %q", key, val) }
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid integer %q", key, val)
+	}
 	return n, nil
 }
 
-// (متدهای Float و Duration هم مشابه Int با فرمت خطای اختصاصی)
+func getEnvFloat(key string, def float64) (float64, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(val) == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid float %q", key, val)
+	}
+	return f, nil
+}
+
+func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
+	val, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(val) == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(val))
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid duration %q (e.g. 5s, 10m)", key, val)
+	}
+	return d, nil
+}
